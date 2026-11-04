@@ -1,0 +1,37 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+flarelens-agent
+flarelensd
+agent
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local configuration & environment variables
+.env
+.env.*
+*.env
+*.env.*
+*.env.local
+agent.yaml
+configs/agent.local.yaml
+
+# WAL disk buffer & logs
+*.log
+wal/
+
+# IDE and OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

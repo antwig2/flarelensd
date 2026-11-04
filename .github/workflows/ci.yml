@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Verify Dependencies
+        run: |
+          go mod verify
+          git diff --exit-code go.mod go.sum
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -v -race ./...
+
+      - name: Verify GoReleaser Config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check
+
+  cross-compile:
+    name: Cross-Compile Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            output: bin/flarelensd-linux-amd64
+          - os: linux
+            arch: arm64
+            output: bin/flarelensd-linux-arm64
+          - os: windows
+            arch: amd64
+            output: bin/flarelensd-windows-amd64.exe
+          - os: darwin
+            arch: amd64
+            output: bin/flarelensd-darwin-amd64
+          - os: darwin
+            arch: arm64
+            output: bin/flarelensd-darwin-arm64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Compile for ${{ matrix.os }}/${{ matrix.arch }}
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p bin
+          go build -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/agent
+          ls -lh ${{ matrix.output }}
