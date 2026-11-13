@@ -15,8 +15,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,8 +31,11 @@ import (
 	"github.com/antwig2/flarelens/internal/mesh"
 	"github.com/antwig2/flarelens/internal/system"
 	"github.com/antwig2/flarelens/internal/transport"
+	"github.com/antwig2/flarelens/internal/updater"
 	"github.com/nats-io/nats.go"
 )
+
+var activeBackupOps atomic.Int32
 
 var (
 	Version = "2.1.0"
@@ -42,6 +47,79 @@ var (
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version" || os.Args[1] == "-v") {
 		fmt.Printf("FlareLens Host Agent v%s (commit: %s, built at: %s, built by: %s)\n", Version, Commit, Date, BuiltBy)
+		os.Exit(0)
+	}
+
+	// Subcommand: self-update (Over-The-Air atomic binary upgrade with SHA-256 verification)
+	if len(os.Args) > 1 && (os.Args[1] == "self-update" || os.Args[1] == "update") {
+		updateFlags := flag.NewFlagSet("self-update", flag.ExitOnError)
+		controlURL := updateFlags.String("control", os.Getenv("FLARELENS_ENDPOINT"), "FlareLens Control Plane URL")
+		token := updateFlags.String("token", os.Getenv("FLARELENS_ENROLL_TOKEN"), "Control plane auth token")
+		targetVer := updateFlags.String("version", "", "Target release version (default: latest registered release)")
+		expectedSHA := updateFlags.String("sha256", "", "Expected SHA-256 hex digest (fetched from control plane if omitted)")
+		downloadURL := updateFlags.String("url", "", "Optional explicit binary download URL")
+		force := updateFlags.Bool("force", false, "Reinstall even if already on target version")
+		configPath := updateFlags.String("config", "", "Optional path to agent config file")
+		_ = updateFlags.Parse(os.Args[2:])
+
+		if *controlURL == "" || *token == "" {
+			var cfgArgs []string
+			if *configPath != "" {
+				cfgArgs = []string{"--config", *configPath}
+			}
+			if loadedCfg, err := config.Load(cfgArgs); err == nil {
+				if *controlURL == "" {
+					*controlURL = loadedCfg.ControlPlane.Endpoint
+				}
+				if *token == "" {
+					*token = loadedCfg.ControlPlane.EnrollToken
+				}
+			}
+		}
+
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		ver := strings.TrimSpace(*targetVer)
+		sum := strings.TrimSpace(*expectedSHA)
+		dl := strings.TrimSpace(*downloadURL)
+
+		if sum == "" && *controlURL != "" {
+			relVer, relSum, relURL, err := fetchLatestReleaseMetadata(ctx, *controlURL, *token, ver)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to query release metadata from control plane: %v\n", err)
+				os.Exit(1)
+			}
+			ver = cmp.Or(ver, relVer)
+			sum = cmp.Or(sum, relSum)
+			dl = cmp.Or(dl, relURL)
+		}
+
+		upd := updater.New(updater.Config{
+			CurrentVersion: Version,
+			ControlURL:     *controlURL,
+			AuthToken:      *token,
+			Logger:         logger,
+			OnRestart:      func(string) error { return nil },
+		})
+
+		res, err := upd.Apply(ctx, updater.UpdateRequest{
+			Version:     ver,
+			SHA256:      sum,
+			DownloadURL: dl,
+			Force:       *force,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Self-update failed: %v\n", err)
+			os.Exit(1)
+		}
+		if res.Status == "up_to_date" {
+			fmt.Printf("✅ FlareLens Host Agent is already up to date (v%s)\n", res.PreviousVersion)
+			os.Exit(0)
+		}
+		fmt.Printf("✅ Updated FlareLens Host Agent: v%s -> %s\n• Binary: %s\n• SHA-256: %s\n",
+			res.PreviousVersion, res.TargetVersion, res.ExecutablePath, res.SHA256)
 		os.Exit(0)
 	}
 
@@ -347,27 +425,32 @@ func main() {
 	)
 	backupMgr := backup.NewManager(dumper, r2Client, natsClient, cfg, logger)
 
-	// Helper to resolve target DB from service
-	resolveDBForService := func(service string) string {
-		s := strings.ToLower(service)
-		if strings.Contains(s, "workflow") {
-			return "workflow_db"
-		}
-		return cmp.Or(cfg.Database.Database, os.Getenv("PGDATABASE"), "postgres")
+	// Helper to resolve target DB from deploy context hint or host config
+	resolveTargetDB := func(hookCtx context.Context) string {
+		return cmp.Or(
+			deploy.TargetDBFromContext(hookCtx),
+			cfg.Database.Database,
+			os.Getenv("PGDATABASE"),
+			"postgres",
+		)
 	}
 
 	// Hook pre-deploy database snapshot guardrail into deploy orchestrator
 	deployOrchestrator.SetPreDeployHook(func(hookCtx context.Context, service, tag string) error {
-		targetDB := resolveDBForService(service)
+		targetDB := resolveTargetDB(hookCtx)
 		logger.Info("Executing pre-deploy database snapshot guardrail", "service", service, "database", targetDB, "tag", tag)
+		activeBackupOps.Add(1)
+		defer activeBackupOps.Add(-1)
 		_, hookErr := backupMgr.CreateBackupForDB(hookCtx, tag, targetDB)
 		return hookErr
 	})
 
 	// Hook automated snapshot rollback in case of migration failure
 	deployOrchestrator.SetRollbackHook(func(hookCtx context.Context, service, tag string) error {
-		targetDB := resolveDBForService(service)
+		targetDB := resolveTargetDB(hookCtx)
 		logger.Warn("Executing automated snapshot rollback following migration failure", "service", service, "database", targetDB, "tag", tag)
+		activeBackupOps.Add(1)
+		defer activeBackupOps.Add(-1)
 		return backupMgr.RestoreLatestMatchingTag(hookCtx, tag, targetDB)
 	})
 
@@ -444,6 +527,24 @@ func main() {
 		}
 	}
 
+	agentUpdater := updater.New(updater.Config{
+		CurrentVersion: Version,
+		ControlURL:     cfg.ControlPlane.Endpoint,
+		AuthToken:      cfg.ControlPlane.EnrollToken,
+		Logger:         logger,
+		IsIdle: func() bool {
+			return deployOrchestrator.ActiveOps() == 0 && activeBackupOps.Load() == 0
+		},
+		OnRestart: func(execPath string) error {
+			logger.Warn("OTA binary swap complete; exiting cleanly for service supervisor handover", "executable", execPath)
+			go func() {
+				time.Sleep(250 * time.Millisecond)
+				os.Exit(0)
+			}()
+			return nil
+		},
+	})
+
 	if cfg.NATS.Mode == "embedded" || cfg.DevMode {
 		embedOpts := transport.EmbeddedOptions{
 			DontListen: cfg.DevMode, // In dev mode, run 100% in-process with zero open ports!
@@ -454,7 +555,7 @@ func main() {
 		if err := natsClient.StartEmbedded(ctx, embedOpts); err != nil {
 			logger.Error("Failed to start embedded NATS server", "error", err)
 		} else {
-			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, cfg, logger)
+			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, agentUpdater, cfg, logger)
 		}
 	} else if cfg.NATS.Mode != "disabled" && cfg.NATS.Mode != "none" && cfg.NATS.Mode != "off" {
 		if err := natsClient.Connect(ctx); err != nil {
@@ -463,7 +564,7 @@ func main() {
 				"error", err,
 			)
 		} else {
-			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, cfg, logger)
+			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, agentUpdater, cfg, logger)
 		}
 	} else {
 		logger.Info("NATS transport disabled; operating in HTTPS / Cloudflare Edge Control Plane mode")
@@ -479,8 +580,11 @@ func main() {
 	// 6. Launch background telemetry heartbeat loop (every 15s)
 	go reporter.StartHeartbeatLoop(ctx)
 
-	// 6b. Launch background command poller loop (polls control plane every 3s for UI snapshots, restores & deployments)
-	go startCommandPoller(ctx, backupMgr, deployOrchestrator, cfg, logger)
+	// 6a. Reconcile stable Docker DNS aliases for already-running containers on host startup
+	go deployOrchestrator.ReconcileActiveAliases(ctx)
+
+	// 6b. Launch background command poller loop (polls control plane every 3s for UI snapshots, restores, deployments & OTA updates)
+	go startCommandPoller(ctx, backupMgr, deployOrchestrator, agentUpdater, cfg, logger)
 
 	// 6c. Launch background Feature Flags sync daemon (polls control plane every 5s & syncs to /etc/flarelens/flags)
 	go startFlagSyncDaemon(ctx, flagStore, cfg, logger)
@@ -524,6 +628,7 @@ func registerCommandListeners(
 	backupMgr *backup.Manager,
 	flagStore *flags.Store,
 	meshMgr *mesh.Manager,
+	agentUpdater *updater.Updater,
 	cfg *config.Config,
 	logger *slog.Logger,
 ) {
@@ -755,11 +860,62 @@ func registerCommandListeners(
 		_, _ = nc.Subscribe(nodeMeshSubj, syncHandler)
 	}
 
+	// 10. Singleton / Stateful Manifest Reconciler
+	singletonSubj := fmt.Sprintf("flarelens.node.%s.singleton", nodeID)
+	_, _ = nc.Subscribe(singletonSubj, func(msg *nats.Msg) {
+		var spec deploy.SingletonSpec
+		if err := json.Unmarshal(msg.Data, &spec); err != nil {
+			logger.Error("Malformed singleton reconcile payload", "error", err)
+			return
+		}
+		if spec.NodeID != "" && spec.NodeID != "all" && spec.NodeID != nodeID {
+			return
+		}
+		go func(s deploy.SingletonSpec, replySubject string) {
+			resp := orchestrator.ReconcileSingleton(context.Background(), s)
+			if replySubject != "" {
+				_ = nc.PublishJSON(replySubject, resp)
+			}
+			if cfg.ControlPlane.Endpoint != "" {
+				reportHTTPStatus(
+					fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+					cfg.ControlPlane.EnrollToken,
+					map[string]any{
+						"deployment_id": resp.DeploymentID,
+						"service":       resp.Service,
+						"status":        resp.Status,
+						"active_slot":   resp.ActiveSlot,
+						"message":       resp.Message,
+						"duration_ms":   resp.DurationMS,
+					},
+					logger,
+				)
+			}
+		}(spec, msg.Reply)
+	})
+
+	// 11. Over-The-Air (OTA) Agent Self-Update Trigger
+	updateSubj := fmt.Sprintf("flarelens.node.%s.update", nodeID)
+	if agentUpdater != nil {
+		handleUpdate := func(msg *nats.Msg) {
+			var uReq updater.UpdateRequest
+			if err := json.Unmarshal(msg.Data, &uReq); err != nil {
+				logger.Error("Malformed self-update payload", "error", err)
+				return
+			}
+			go executeSelfUpdate(agentUpdater, uReq, "", nodeID, cfg, logger)
+		}
+		_, _ = nc.Subscribe(updateSubj, handleUpdate)
+		_, _ = nc.Subscribe("flarelens.fleet.all.update", handleUpdate)
+	}
+
 	logger.Info("NATS command listeners registered",
 		"reboot_subject", rebootSubj,
 		"config_subject", configSubj,
 		"flag_subject", flagSubj,
 		"deploy_subject", deploySubj,
+		"singleton_subject", singletonSubj,
+		"update_subject", updateSubj,
 		"backup_subject", backupSubj,
 		"restore_subject", restoreSubj,
 		"list_subject", listSubj,
@@ -771,66 +927,167 @@ func reportHTTPStatus(url string, token string, payload any, logger *slog.Logger
 	if url == "" {
 		return
 	}
+	go reportHTTPStatusSync(url, token, payload, logger)
+}
+
+func reportHTTPStatusSync(url string, token string, payload any, logger *slog.Logger) {
+	if url == "" {
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	go func() {
-		client := &http.Client{Timeout: 10 * time.Second}
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if token != "" {
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			logger.Warn("Failed to report HTTP status to control plane", "url", url, "error", err)
-			return
-		}
-		_ = resp.Body.Close()
-	}()
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Warn("Failed to report HTTP status to control plane", "url", url, "error", err)
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+func fetchLatestReleaseMetadata(ctx context.Context, controlURL, token, wantVersion string) (string, string, string, error) {
+	targetArch := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	endpoint := fmt.Sprintf("%s/api/v1/control/agent/releases?target=%s",
+		strings.TrimRight(controlURL, "/"),
+		url.QueryEscape(targetArch),
+	)
+	if wantVersion != "" {
+		endpoint += "&version=" + url.QueryEscape(wantVersion)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", "", "", err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", "", "", fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var payload struct {
+		Release *struct {
+			Version     string `json:"version"`
+			SHA256      string `json:"sha256"`
+			DownloadURL string `json:"download_url"`
+		} `json:"release"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", "", "", err
+	}
+	if payload.Release == nil || payload.Release.SHA256 == "" {
+		return "", "", "", fmt.Errorf("no published release metadata found for %s", targetArch)
+	}
+	return payload.Release.Version, payload.Release.SHA256, payload.Release.DownloadURL, nil
+}
+
+func executeSelfUpdate(
+	agentUpdater *updater.Updater,
+	uReq updater.UpdateRequest,
+	commandID string,
+	nodeID string,
+	cfg *config.Config,
+	logger *slog.Logger,
+) {
+	statusURL := ""
+	if cfg.ControlPlane.Endpoint != "" {
+		statusURL = fmt.Sprintf("%s/api/v1/control/agent/update/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"))
+	}
+	reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+		"command_id":       commandID,
+		"node_id":          nodeID,
+		"previous_version": Version,
+		"target_version":   uReq.Version,
+		"status":           "updating",
+	}, logger)
+
+	res, err := agentUpdater.Apply(context.Background(), uReq)
+	if err != nil {
+		logger.Error("OTA self-update failed", "target_version", uReq.Version, "error", err)
+		reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+			"command_id":       commandID,
+			"node_id":          nodeID,
+			"previous_version": Version,
+			"target_version":   uReq.Version,
+			"status":           "failed",
+			"error":            err.Error(),
+		}, logger)
+		return
+	}
+
+	reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+		"command_id":       commandID,
+		"node_id":          nodeID,
+		"previous_version": res.PreviousVersion,
+		"target_version":   res.TargetVersion,
+		"sha256":           res.SHA256,
+		"status":           res.Status,
+	}, logger)
 }
 
 type NodeCommand struct {
-	ID                string            `json:"id"`
-	Type              string            `json:"type"`
-	NodeID            string            `json:"node_id"`
-	Tag               string            `json:"tag"`
-	Key               string            `json:"key"`
-	TargetDB          string            `json:"target_db"`
-	DeploymentID      string            `json:"deployment_id"`
-	Service           string            `json:"service"`
-	Image             string            `json:"image"`
-	Env               string            `json:"env"`
-	ContainerPort     int               `json:"container_port"`
-	HostPortBlue      int               `json:"host_port_blue"`
-	HostPortGreen     int               `json:"host_port_green"`
-	Domain            string            `json:"domain"`
-	HealthPath        string            `json:"health_path"`
-	Secrets           map[string]string `json:"secrets"`
-	Network           string            `json:"network"`
-	CanaryWeight      int               `json:"canary_weight"`
-	CanaryDuration    int               `json:"canary_duration"`
-	PreDeploySnapshot bool              `json:"pre_deploy_snapshot"`
-	RunMigrations     bool                `json:"run_migrations"`
-	MigrationCmd      string              `json:"migration_cmd"`
-	Command           []string            `json:"command"`
-	Entrypoint        []string            `json:"entrypoint"`
-	Networks          []string            `json:"networks"`
-	Volumes           []string            `json:"volumes"`
-	Workers           []deploy.WorkerSpec `json:"workers"`
-	IsPreview         bool                `json:"is_preview"`
-	PRNumber          int                 `json:"pr_number"`
+	ID                    string                  `json:"id"`
+	Type                  string                  `json:"type"`
+	NodeID                string                  `json:"node_id"`
+	Tag                   string                  `json:"tag"`
+	Key                   string                  `json:"key"`
+	TargetDB              string                  `json:"target_db"`
+	DeploymentID          string                  `json:"deployment_id"`
+	Service               string                  `json:"service"`
+	Image                 string                  `json:"image"`
+	Env                   string                  `json:"env"`
+	ContainerName         string                  `json:"container_name"`
+	Restart               string                  `json:"restart"`
+	Ports                 []string                `json:"ports"`
+	Healthcheck           *deploy.HealthcheckSpec `json:"healthcheck"`
+	ForceRecreateStateful bool                    `json:"force_recreate_stateful"`
+	ContainerPort         int                     `json:"container_port"`
+	HostPortBlue          int                     `json:"host_port_blue"`
+	HostPortGreen         int                     `json:"host_port_green"`
+	Domain                string                  `json:"domain"`
+	HealthPath            string                  `json:"health_path"`
+	Secrets               map[string]string       `json:"secrets"`
+	Network               string                  `json:"network"`
+	CanaryWeight          int                     `json:"canary_weight"`
+	CanaryDuration        int                     `json:"canary_duration"`
+	PreDeploySnapshot     bool                    `json:"pre_deploy_snapshot"`
+	RunMigrations         bool                    `json:"run_migrations"`
+	MigrationCmd          string                  `json:"migration_cmd"`
+	Command               []string                `json:"command"`
+	Entrypoint            []string                `json:"entrypoint"`
+	Networks              []string                `json:"networks"`
+	Aliases               []string                `json:"aliases"`
+	Volumes               []string                `json:"volumes"`
+	Workers               []deploy.WorkerSpec     `json:"workers"`
+	IsPreview             bool                    `json:"is_preview"`
+	PRNumber              int                     `json:"pr_number"`
+	Version               string                  `json:"version"`
+	SHA256                string                  `json:"sha256"`
+	DownloadURL           string                  `json:"download_url"`
+	Force                 bool                    `json:"force"`
 }
 
 type CommandsResponse struct {
 	Commands []NodeCommand `json:"commands"`
 }
 
-func startCommandPoller(ctx context.Context, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, cfg *config.Config, logger *slog.Logger) {
+func startCommandPoller(ctx context.Context, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, agentUpdater *updater.Updater, cfg *config.Config, logger *slog.Logger) {
 	if cfg.ControlPlane.Endpoint == "" {
 		return
 	}
@@ -846,14 +1103,14 @@ func startCommandPoller(ctx context.Context, backupMgr *backup.Manager, orchestr
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pollAndExecuteCommands(ctx, client, backupMgr, orchestrator, cfg, nodeID, logger)
+			pollAndExecuteCommands(ctx, client, backupMgr, orchestrator, agentUpdater, cfg, nodeID, logger)
 		}
 	}
 }
 
 var inFlightCommands sync.Map
 
-func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, cfg *config.Config, nodeID string, logger *slog.Logger) {
+func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, agentUpdater *updater.Updater, cfg *config.Config, nodeID string, logger *slog.Logger) {
 	reqURL := fmt.Sprintf("%s/api/v1/control/commands?node_id=%s", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"), url.QueryEscape(nodeID))
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -912,7 +1169,7 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 				if orchestrator != nil && os.Getenv("FLARELENS_USE_HOST_SCRIPTS") != "true" {
 					logger.Info("Executing native container orchestration (zero-downtime)", "service", c.Service, "image", c.Image)
 					dReq := deploy.DeployRequest{
-						DeploymentID:      c.ID,
+						DeploymentID:      cmp.Or(c.DeploymentID, c.ID),
 						Service:           c.Service,
 						Image:             c.Image,
 						Env:               c.Env,
@@ -924,10 +1181,12 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 						Command:           c.Command,
 						Entrypoint:        c.Entrypoint,
 						Networks:          c.Networks,
+						Aliases:           c.Aliases,
 						Volumes:           c.Volumes,
 						Workers:           c.Workers,
 						Secrets:           c.Secrets,
 						Network:           c.Network,
+						TargetDB:          c.TargetDB,
 						CanaryWeight:      c.CanaryWeight,
 						CanaryDuration:    c.CanaryDuration,
 						PreDeploySnapshot: c.PreDeploySnapshot,
@@ -962,7 +1221,7 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 						fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
 						cfg.ControlPlane.EnrollToken,
 						map[string]any{
-							"deployment_id": c.ID,
+							"deployment_id": cmp.Or(c.DeploymentID, c.ID),
 							"service":       c.Service,
 							"status":        deployStatus,
 							"message":       deployMsg,
@@ -974,8 +1233,67 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
 
+		case "reconcile_singleton":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator == nil {
+					return
+				}
+				logger.Info("Executing singleton manifest reconciliation...", "service", c.Service, "container", c.ContainerName, "id", c.ID)
+				resp := orchestrator.ReconcileSingleton(context.Background(), deploy.SingletonSpec{
+					DeploymentID:          cmp.Or(c.DeploymentID, c.ID),
+					NodeID:                c.NodeID,
+					Service:               c.Service,
+					Env:                   c.Env,
+					Image:                 c.Image,
+					ContainerName:         c.ContainerName,
+					Restart:               c.Restart,
+					Networks:              c.Networks,
+					Aliases:               c.Aliases,
+					Volumes:               c.Volumes,
+					Ports:                 c.Ports,
+					Command:               c.Command,
+					Entrypoint:            c.Entrypoint,
+					Healthcheck:           c.Healthcheck,
+					Secrets:               c.Secrets,
+					ForceRecreateStateful: c.ForceRecreateStateful,
+				})
+				if cfg.ControlPlane.Endpoint != "" {
+					reportHTTPStatus(
+						fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+						cfg.ControlPlane.EnrollToken,
+						map[string]any{
+							"deployment_id": resp.DeploymentID,
+							"service":       resp.Service,
+							"status":        resp.Status,
+							"active_slot":   resp.ActiveSlot,
+							"message":       resp.Message,
+							"duration_ms":   resp.DurationMS,
+						},
+						logger,
+					)
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+
+		case "self_update":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if agentUpdater == nil {
+					return
+				}
+				logger.Info("Executing queued OTA self-update command...", "target_version", c.Version, "id", c.ID)
+				executeSelfUpdate(agentUpdater, updater.UpdateRequest{
+					Version:     c.Version,
+					SHA256:      c.SHA256,
+					DownloadURL: c.DownloadURL,
+					Force:       c.Force,
+				}, c.ID, nodeID, cfg, logger)
+			}(cmd)
+
 		case "preview_teardown":
 			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
 				logger.Info("Executing queued preview teardown...", "service", c.Service, "pr_number", c.PRNumber, "command_id", c.ID)
 				if orchestrator != nil {
 					tdReq := deploy.TeardownRequest{
@@ -988,6 +1306,9 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 			}(cmd)
 		case "backup":
 			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				activeBackupOps.Add(1)
+				defer activeBackupOps.Add(-1)
 				tag := c.Tag
 				if tag == "" {
 					tag = "manual_ui"
@@ -1023,6 +1344,9 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 
 		case "restore":
 			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				activeBackupOps.Add(1)
+				defer activeBackupOps.Add(-1)
 				logger.Info("Executing queued database restore...", "key", c.Key, "target_db", c.TargetDB, "command_id", c.ID)
 				err := backupMgr.RestoreBackup(context.Background(), c.Key, c.TargetDB)
 				statusPayload := map[string]any{
@@ -1046,6 +1370,8 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 				)
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
+		default:
+			inFlightCommands.Delete(cmd.ID)
 		}
 	}
 }

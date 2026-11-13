@@ -245,4 +245,3 @@ func TestNativeWGControllerSync(t *testing.T) {
 		t.Errorf("Expected configured peer public key %s, got %s", peerPub, mockCtrl.lastConfig.Peers[0].PublicKey.String())
 	}
 }
-

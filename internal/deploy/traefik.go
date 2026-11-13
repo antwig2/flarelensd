@@ -42,7 +42,7 @@ func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, tar
 
 	targetURL := fmt.Sprintf("http://%s:%d", targetHost, targetPort)
 
-	// Check if existing route file exists (e.g. uat-bill-api.yml, prod-bill-api.yml, etc.)
+	// Check if existing route file exists (e.g. uat-orders-api.yml, prod-orders-api.yml, etc.)
 	candidates := []string{
 		filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yml", stack, service)),
 		filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yaml", stack, service)),
@@ -66,12 +66,25 @@ func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, tar
 		}
 	}
 
-	// Fall back to generating clean Traefik router config
+	// Fall back to generating clean Traefik router config pointing directly at targetHost:targetPort
+	if domain == "" {
+		return fmt.Errorf("cannot create Traefik route for %s-%s: domain is empty", stack, service)
+	}
+	if targetHost != "" && targetHost != "127.0.0.1" {
+		return t.flipRouteURL(fmt.Sprintf("%s-%s", stack, service), domain, targetURL)
+	}
 	return t.FlipRoute(fmt.Sprintf("%s-%s", stack, service), domain, targetPort)
 }
 
-// FlipRoute atomically points Traefik domain traffic to the target port
+// FlipRoute atomically points Traefik domain traffic to the target host port on loopback
 func (t *TraefikRouteFlipper) FlipRoute(service, domain string, targetPort int) error {
+	return t.flipRouteURL(service, domain, fmt.Sprintf("http://127.0.0.1:%d", targetPort))
+}
+
+func (t *TraefikRouteFlipper) flipRouteURL(service, domain, upstreamURL string) error {
+	if domain == "" {
+		return fmt.Errorf("cannot flip Traefik route for %s: domain is empty", service)
+	}
 	if err := os.MkdirAll(t.dynamicDir, 0755); err != nil {
 		return fmt.Errorf("failed to create traefik dynamic config directory: %w", err)
 	}
@@ -87,8 +100,8 @@ func (t *TraefikRouteFlipper) FlipRoute(service, domain string, targetPort int) 
     %s-svc:
       loadBalancer:
         servers:
-          - url: "http://127.0.0.1:%d"
-`, service, fmt.Sprintf("`%s`", domain), service, service, targetPort)
+          - url: %q
+`, service, fmt.Sprintf("`%s`", domain), service, service, upstreamURL)
 
 	finalPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", service))
 	tmpPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml.tmp", service))

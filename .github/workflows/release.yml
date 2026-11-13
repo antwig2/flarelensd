@@ -11,10 +11,16 @@ on:
         required: false
         type: boolean
         default: false
+      control_url:
+        description: 'Optional FlareLens Control Plane URL for OTA binary publishing'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   goreleaser:
@@ -43,3 +49,40 @@ jobs:
           args: ${{ inputs.snapshot && 'release --snapshot --clean' || 'release --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Linux OTA Release to FlareLens Control Plane (GitHub OIDC)
+        if: ${{ !inputs.snapshot && (inputs.control_url != '' || vars.FLARELENS_CONTROL_URL != '') }}
+        env:
+          CONTROL_URL: ${{ inputs.control_url || vars.FLARELENS_CONTROL_URL }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${CONTROL_URL%/}"
+
+          OIDC_RESP="$(curl -fsSL \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${BASE_URL}")"
+          OIDC_TOKEN="$(printf '%s' "${OIDC_RESP}" | jq -r '.value')"
+
+          for ARCH in amd64 arm64; do
+            TARGET="linux-${ARCH}"
+            BIN_PATH="dist/flarelensd-linux-${ARCH}"
+            if [ ! -f "${BIN_PATH}" ]; then
+              BIN_PATH="$(find dist -type f -path "*linux_${ARCH}*/flarelensd" | head -n 1)"
+            fi
+            if [ -z "${BIN_PATH}" ] || [ ! -f "${BIN_PATH}" ]; then
+              echo "::error::Missing built binary for ${TARGET}"
+              exit 1
+            fi
+
+            SHA256="$(sha256sum "${BIN_PATH}" | awk '{print $1}')"
+            echo "Publishing ${TARGET} (${RELEASE_VERSION}, sha256=${SHA256}) to ${BASE_URL}..."
+
+            curl -fsSL -X POST \
+              "${BASE_URL}/api/v1/control/agent/release?version=${RELEASE_VERSION}&target=${TARGET}&sha256=${SHA256}&commit_sha=${COMMIT_SHA}" \
+              -H "Authorization: Bearer ${OIDC_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${BIN_PATH}"
+            echo ""
+          done

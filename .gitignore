@@ -6,9 +6,9 @@ dist/
 *.dll
 *.so
 *.dylib
-flarelens-agent
-flarelensd
-agent
+/flarelens-agent
+/flarelensd
+/agent
 
 # Test binaries and coverage
 *.test

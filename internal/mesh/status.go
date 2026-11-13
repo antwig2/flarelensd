@@ -226,4 +226,3 @@ func RunStatus(ctx context.Context, logger *slog.Logger) error {
 	fmt.Println("================================================================")
 	return nil
 }
-

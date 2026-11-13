@@ -64,7 +64,7 @@ func TestFormatHelpers(t *testing.T) {
 	if FormatTimeAgo(time.Time{}) != "never" {
 		t.Errorf("Expected 'never', got '%s'", FormatTimeAgo(time.Time{}))
 	}
-	if FormatTimeAgo(time.Now().Add(-15 * time.Second)) != "15s ago" {
+	if FormatTimeAgo(time.Now().Add(-15*time.Second)) != "15s ago" {
 		t.Errorf("Expected '15s ago', got '%s'", FormatTimeAgo(time.Now().Add(-15*time.Second)))
 	}
 }
@@ -91,4 +91,3 @@ func TestRunStatusWithSavedState(t *testing.T) {
 		t.Fatalf("RunStatus failed: %v", err)
 	}
 }
-

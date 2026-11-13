@@ -4,9 +4,9 @@ import "time"
 
 // WorkerSpec defines a companion background worker container (like Kamal workers)
 type WorkerSpec struct {
-	Name       string   `json:"name"`                 // e.g. "bill-drainer"
+	Name       string   `json:"name"`                 // e.g. "job-drainer"
 	Command    []string `json:"command,omitempty"`    // e.g. ["drainer", "start"]
-	Entrypoint []string `json:"entrypoint,omitempty"` // e.g. ["/inferri", "worker", "start"]
+	Entrypoint []string `json:"entrypoint,omitempty"` // e.g. ["/app", "worker", "start"]
 	Volumes    []string `json:"volumes,omitempty"`    // host:container bind mounts
 	Networks   []string `json:"networks,omitempty"`   // additional docker networks
 }
@@ -14,23 +14,25 @@ type WorkerSpec struct {
 // DeployRequest defines a declarative deployment trigger
 type DeployRequest struct {
 	DeploymentID      string            `json:"deployment_id"`
-	Service           string            `json:"service"`          // e.g. "api-server"
-	Image             string            `json:"image"`            // e.g. "ghcr.io/org/api-server:v1.0"
-	Env               string            `json:"env"`              // "prod", "staging", "uat"
-	Domain            string            `json:"domain"`           // e.g. "api.example.com"
-	ContainerPort     int               `json:"container_port"`   // internal port, e.g. 8081
-	HostPortBlue      int               `json:"host_port_blue"`   // host port for blue slot
-	HostPortGreen     int               `json:"host_port_green"`  // host port for green slot
-	HealthPath        string            `json:"health_path"`      // e.g. "/health"
+	Service           string            `json:"service"`         // e.g. "api-server"
+	Image             string            `json:"image"`           // e.g. "ghcr.io/org/api-server:v1.0"
+	Env               string            `json:"env"`             // "prod", "staging", "uat"
+	Domain            string            `json:"domain"`          // e.g. "api.example.com"
+	ContainerPort     int               `json:"container_port"`  // internal port, e.g. 8081
+	HostPortBlue      int               `json:"host_port_blue"`  // host port for blue slot
+	HostPortGreen     int               `json:"host_port_green"` // host port for green slot
+	HealthPath        string            `json:"health_path"`     // e.g. "/health"
 	Command           []string          `json:"command,omitempty"`
 	Entrypoint        []string          `json:"entrypoint,omitempty"`
 	Volumes           []string          `json:"volumes,omitempty"`
 	Networks          []string          `json:"networks,omitempty"` // e.g. ["flarelens-edge", "prod"]
+	Aliases           []string          `json:"aliases,omitempty"`  // stable Docker DNS aliases promoted onto active slot
 	Workers           []WorkerSpec      `json:"workers,omitempty"`  // companion background workers
 	TimeoutSeconds    int               `json:"timeout_seconds"`
 	DrainSeconds      int               `json:"drain_seconds"`
-	Secrets           map[string]string `json:"secrets"`          // in-memory env secrets (zero disk write)
-	Network           string            `json:"network"`          // primary network fallback
+	Secrets           map[string]string `json:"secrets"`             // in-memory env secrets (zero disk write)
+	Network           string            `json:"network"`             // primary network fallback
+	TargetDB          string            `json:"target_db,omitempty"` // optional target database name for pre-deploy snapshots
 	PreDeploySnapshot bool              `json:"pre_deploy_snapshot"`
 	NodeID            string            `json:"node_id"`
 	RunMigrations     bool              `json:"run_migrations"`
@@ -62,7 +64,7 @@ type DeployProgress struct {
 type DeployResponse struct {
 	DeploymentID string `json:"deployment_id"`
 	Service      string `json:"service"`
-	Status       string `json:"status"` // "success", "failed", "rolled_back"
+	Status       string `json:"status"`      // "success", "failed", "rolled_back"
 	ActiveSlot   string `json:"active_slot"` // "blue" or "green"
 	ActivePort   int    `json:"active_port"`
 	Message      string `json:"message"`

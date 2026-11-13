@@ -2,17 +2,20 @@ package deploy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -127,17 +130,36 @@ func resolveRegistryAuth(image string) string {
 }
 
 type containerCreateConfig struct {
-	Image        string                         `json:"Image"`
-	Cmd          []string                       `json:"Cmd,omitempty"`
-	Entrypoint   []string                       `json:"Entrypoint,omitempty"`
-	Env          []string                       `json:"Env"`
-	Labels       map[string]string              `json:"Labels,omitempty"`
-	ExposedPorts map[string]struct{}            `json:"ExposedPorts,omitempty"`
-	HostConfig   containerHostConfig            `json:"HostConfig"`
+	Image            string                     `json:"Image"`
+	Cmd              []string                   `json:"Cmd,omitempty"`
+	Entrypoint       []string                   `json:"Entrypoint,omitempty"`
+	Env              []string                   `json:"Env"`
+	Labels           map[string]string          `json:"Labels,omitempty"`
+	ExposedPorts     map[string]struct{}        `json:"ExposedPorts,omitempty"`
+	Healthcheck      *ContainerHealthcheck      `json:"Healthcheck,omitempty"`
+	HostConfig       containerHostConfig        `json:"HostConfig"`
+	NetworkingConfig *containerNetworkingConfig `json:"NetworkingConfig,omitempty"`
+}
+
+// ContainerHealthcheck maps to Docker Engine API HealthConfig
+type ContainerHealthcheck struct {
+	Test       []string `json:"Test,omitempty"`
+	IntervalNs int64    `json:"Interval,omitempty"`
+	TimeoutNs  int64    `json:"Timeout,omitempty"`
+	Retries    int      `json:"Retries,omitempty"`
+}
+
+type containerNetworkingConfig struct {
+	EndpointsConfig map[string]networkEndpointConfig `json:"EndpointsConfig,omitempty"`
+}
+
+type networkEndpointConfig struct {
+	Aliases []string `json:"Aliases,omitempty"`
 }
 
 type containerHostConfig struct {
 	Binds         []string                      `json:"Binds,omitempty"`
+	ExtraHosts    []string                      `json:"ExtraHosts,omitempty"`
 	PortBindings  map[string][]portBindingEntry `json:"PortBindings,omitempty"`
 	NetworkMode   string                        `json:"NetworkMode,omitempty"`
 	OomScoreAdj   int                           `json:"OomScoreAdj"`
@@ -159,6 +181,7 @@ func determineOomScore(serviceName string) int {
 }
 
 type portBindingEntry struct {
+	HostIP   string `json:"HostIp,omitempty"`
 	HostPort string `json:"HostPort"`
 }
 
@@ -174,20 +197,101 @@ type ContainerConfig struct {
 	Cmd           []string
 	Entrypoint    []string
 	Binds         []string
+	ExtraHosts    []string
 	HostPort      int
 	ContainerPort int
+	PortMappings  []string
+	RestartPolicy string
+	Healthcheck   *ContainerHealthcheck
 	Networks      []string
+	Aliases       []string
 	Labels        map[string]string
+}
+
+// ContainerDetail describes the live state of an inspected Docker container
+type ContainerDetail struct {
+	ID       string
+	Running  bool
+	Image    string
+	Labels   map[string]string
+	Networks map[string][]string
+}
+
+// RunningContainerSummary holds network attachment metadata for an active container
+type RunningContainerSummary struct {
+	ID       string
+	Names    []string
+	Labels   map[string]string
+	Networks map[string][]string // networkName -> aliases
+}
+
+// EnsureNetwork idempotently creates a bridge Docker network if it does not already exist
+func (r *DockerRunner) EnsureNetwork(ctx context.Context, networkName string) error {
+	if strings.HasPrefix(r.socket, "mock") || networkName == "" || networkName == "bridge" || networkName == "host" || networkName == "none" {
+		return nil
+	}
+
+	inspectURL := fmt.Sprintf("http://localhost/networks/%s", url.PathEscape(networkName))
+	inspectReq, err := http.NewRequestWithContext(ctx, "GET", inspectURL, nil)
+	if err == nil {
+		if resp, doErr := r.client.Do(inspectReq); doErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+	}
+
+	payload := map[string]any{
+		"Name":           networkName,
+		"Driver":         "bridge",
+		"CheckDuplicate": true,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/networks/create", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("create network %s: %w", networkName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, "already exists") {
+			return fmt.Errorf("create network %s returned %d: %s", networkName, resp.StatusCode, bodyStr)
+		}
+	}
+	return nil
 }
 
 // ConnectNetwork attaches an existing container to a Docker network
 func (r *DockerRunner) ConnectNetwork(ctx context.Context, containerID string, networkName string) error {
+	return r.ConnectNetworkWithAliases(ctx, containerID, networkName, nil)
+}
+
+// ConnectNetworkWithAliases attaches an existing container to a Docker network with optional DNS aliases
+func (r *DockerRunner) ConnectNetworkWithAliases(ctx context.Context, containerID string, networkName string, aliases []string) error {
 	if strings.HasPrefix(r.socket, "mock") || networkName == "" {
 		return nil
 	}
+	_ = r.EnsureNetwork(ctx, networkName)
+
 	u := fmt.Sprintf("http://localhost/networks/%s/connect", url.PathEscape(networkName))
-	payload := map[string]string{
+	payload := map[string]any{
 		"Container": containerID,
+	}
+	if len(aliases) > 0 {
+		payload["EndpointConfig"] = networkEndpointConfig{
+			Aliases: dedupeNonEmptyStrings(aliases),
+		}
 	}
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -214,41 +318,133 @@ func (r *DockerRunner) ConnectNetwork(ctx context.Context, containerID string, n
 	return nil
 }
 
+// DisconnectNetwork detaches a container from a Docker network
+func (r *DockerRunner) DisconnectNetwork(ctx context.Context, containerID string, networkName string, force bool) error {
+	if strings.HasPrefix(r.socket, "mock") || networkName == "" {
+		return nil
+	}
+	u := fmt.Sprintf("http://localhost/networks/%s/disconnect", url.PathEscape(networkName))
+	payload := map[string]any{
+		"Container": containerID,
+		"Force":     force,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("disconnect network %s: %w", networkName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, "is not connected") && !strings.Contains(bodyStr, "not found") {
+			return fmt.Errorf("disconnect network %s returned %d: %s", networkName, resp.StatusCode, bodyStr)
+		}
+	}
+	return nil
+}
+
+// PromoteNetworkAliases ensures containerID is attached to each target network with all stable service DNS aliases.
+// If the container is already attached to a network with all requested aliases, that network is left untouched.
+func (r *DockerRunner) PromoteNetworkAliases(ctx context.Context, containerID string, networks []string, aliases []string) error {
+	cleanAliases := dedupeNonEmptyStrings(aliases)
+	if strings.HasPrefix(r.socket, "mock") || containerID == "" || len(cleanAliases) == 0 {
+		return nil
+	}
+
+	targetNetworks := dedupeNonEmptyStrings(networks)
+	if len(targetNetworks) == 0 {
+		targetNetworks = []string{"flarelens-edge"}
+	}
+
+	existingNets, _ := r.InspectContainerNetworks(ctx, containerID)
+
+	for _, netName := range targetNetworks {
+		existingAliases, connected := existingNets[netName]
+		if connected && containsAllStrings(existingAliases, cleanAliases) {
+			continue
+		}
+		mergedAliases := dedupeNonEmptyStrings(append(slices.Clone(existingAliases), cleanAliases...))
+		if connected {
+			if err := r.DisconnectNetwork(ctx, containerID, netName, false); err != nil {
+				return err
+			}
+		}
+		if err := r.ConnectNetworkWithAliases(ctx, containerID, netName, mergedAliases); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CreateContainerWithOptions creates a container with multi-network, volumes, custom cmd, and entrypoint
 func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg ContainerConfig) (string, error) {
 	primaryNetwork := "flarelens-edge"
 	if len(cfg.Networks) > 0 && cfg.Networks[0] != "" {
 		primaryNetwork = cfg.Networks[0]
 	}
+	_ = r.EnsureNetwork(ctx, primaryNetwork)
+
+	extraHosts := dedupeNonEmptyStrings(append([]string{"host.docker.internal:host-gateway"}, cfg.ExtraHosts...))
 
 	createCfg := containerCreateConfig{
-		Image:      cfg.Image,
-		Cmd:        cfg.Cmd,
-		Entrypoint: cfg.Entrypoint,
-		Env:        cfg.EnvVars,
-		Labels:     cfg.Labels,
+		Image:       cfg.Image,
+		Cmd:         cfg.Cmd,
+		Entrypoint:  cfg.Entrypoint,
+		Env:         cfg.EnvVars,
+		Labels:      cfg.Labels,
+		Healthcheck: cfg.Healthcheck,
 		HostConfig: containerHostConfig{
 			Binds:       cfg.Binds,
+			ExtraHosts:  extraHosts,
 			NetworkMode: primaryNetwork,
 			OomScoreAdj: determineOomScore(cfg.Name),
 			RestartPolicy: restartPolicy{
-				Name: "always",
+				Name: cmp.Or(strings.TrimSpace(cfg.RestartPolicy), "always"),
 			},
 		},
 	}
 
+	if cleanAliases := dedupeNonEmptyStrings(cfg.Aliases); len(cleanAliases) > 0 {
+		createCfg.NetworkingConfig = &containerNetworkingConfig{
+			EndpointsConfig: map[string]networkEndpointConfig{
+				primaryNetwork: {
+					Aliases: cleanAliases,
+				},
+			},
+		}
+	}
+
+	exposedPorts, portBindings := parsePortMappings(cfg.PortMappings)
 	if cfg.ContainerPort > 0 {
 		portKey := fmt.Sprintf("%d/tcp", cfg.ContainerPort)
-		createCfg.ExposedPorts = map[string]struct{}{
-			portKey: {},
+		if exposedPorts == nil {
+			exposedPorts = make(map[string]struct{})
 		}
+		exposedPorts[portKey] = struct{}{}
 		if cfg.HostPort > 0 {
-			createCfg.HostConfig.PortBindings = map[string][]portBindingEntry{
-				portKey: {
-					{HostPort: fmt.Sprintf("%d", cfg.HostPort)},
-				},
+			if portBindings == nil {
+				portBindings = make(map[string][]portBindingEntry)
 			}
+			portBindings[portKey] = append(portBindings[portKey], portBindingEntry{
+				HostPort: fmt.Sprintf("%d", cfg.HostPort),
+			})
 		}
+	}
+	if len(exposedPorts) > 0 {
+		createCfg.ExposedPorts = exposedPorts
+	}
+	if len(portBindings) > 0 {
+		createCfg.HostConfig.PortBindings = portBindings
 	}
 
 	bodyBytes, err := json.Marshal(createCfg)
@@ -285,7 +481,10 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 	if len(cfg.Networks) > 1 {
 		for _, netName := range cfg.Networks[1:] {
 			if netName != "" && netName != primaryNetwork {
-				_ = r.ConnectNetwork(ctx, result.ID, netName)
+				if err := r.ConnectNetworkWithAliases(ctx, result.ID, netName, cfg.Aliases); err != nil {
+					_ = r.RemoveContainer(ctx, result.ID)
+					return "", err
+				}
 			}
 		}
 	}
@@ -458,13 +657,252 @@ func (r *DockerRunner) InspectContainerIP(ctx context.Context, containerID strin
 	if edgeNet, ok := data.NetworkSettings.Networks["flarelens-edge"]; ok && edgeNet.IPAddress != "" {
 		return edgeNet.IPAddress, nil
 	}
+	netNames := slices.Sorted(maps.Keys(data.NetworkSettings.Networks))
+	for _, netName := range netNames {
+		if strings.HasSuffix(netName, "-edge") {
+			if edgeNet := data.NetworkSettings.Networks[netName]; edgeNet.IPAddress != "" {
+				return edgeNet.IPAddress, nil
+			}
+		}
+	}
 	if data.NetworkSettings.IPAddress != "" {
 		return data.NetworkSettings.IPAddress, nil
 	}
-	for _, net := range data.NetworkSettings.Networks {
-		if net.IPAddress != "" {
-			return net.IPAddress, nil
+	for _, netName := range netNames {
+		if netCfg := data.NetworkSettings.Networks[netName]; netCfg.IPAddress != "" {
+			return netCfg.IPAddress, nil
 		}
 	}
 	return "", nil
+}
+
+// InspectContainerDetail retrieves full state, image, labels, and networks for an existing container (nil, nil if absent)
+func (r *DockerRunner) InspectContainerDetail(ctx context.Context, nameOrID string) (*ContainerDetail, error) {
+	if strings.HasPrefix(r.socket, "mock") || strings.TrimSpace(nameOrID) == "" {
+		return nil, nil
+	}
+	u := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(nameOrID))
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("inspect container status %d", resp.StatusCode)
+	}
+
+	var data struct {
+		ID    string `json:"Id"`
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+		Config struct {
+			Image  string            `json:"Image"`
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	nets := make(map[string][]string, len(data.NetworkSettings.Networks))
+	for netName, netCfg := range data.NetworkSettings.Networks {
+		nets[netName] = slices.Clone(netCfg.Aliases)
+	}
+	return &ContainerDetail{
+		ID:       data.ID,
+		Running:  data.State.Running,
+		Image:    data.Config.Image,
+		Labels:   maps.Clone(data.Config.Labels),
+		Networks: nets,
+	}, nil
+}
+
+func parsePortMappings(specs []string) (map[string]struct{}, map[string][]portBindingEntry) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	exposed := make(map[string]struct{})
+	bindings := make(map[string][]portBindingEntry)
+
+	normalizeContainerPort := func(raw string) string {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			return ""
+		}
+		if !strings.Contains(p, "/") {
+			return p + "/tcp"
+		}
+		return p
+	}
+
+	for _, rawSpec := range specs {
+		spec := strings.TrimSpace(rawSpec)
+		if spec == "" {
+			continue
+		}
+		parts := strings.Split(spec, ":")
+		switch len(parts) {
+		case 1:
+			portKey := normalizeContainerPort(parts[0])
+			if portKey != "" {
+				exposed[portKey] = struct{}{}
+			}
+		case 2:
+			hostPort := strings.TrimSpace(parts[0])
+			portKey := normalizeContainerPort(parts[1])
+			if portKey != "" {
+				exposed[portKey] = struct{}{}
+				if hostPort != "" {
+					bindings[portKey] = append(bindings[portKey], portBindingEntry{
+						HostPort: hostPort,
+					})
+				}
+			}
+		default:
+			// e.g. "10.77.77.1:5432:5432" or "[::1]:5432:5432/tcp"
+			containerPart := parts[len(parts)-1]
+			hostPort := strings.TrimSpace(parts[len(parts)-2])
+			hostIP := strings.Trim(strings.Join(parts[:len(parts)-2], ":"), "[]")
+			portKey := normalizeContainerPort(containerPart)
+			if portKey != "" {
+				exposed[portKey] = struct{}{}
+				if hostPort != "" {
+					bindings[portKey] = append(bindings[portKey], portBindingEntry{
+						HostIP:   hostIP,
+						HostPort: hostPort,
+					})
+				}
+			}
+		}
+	}
+	return exposed, bindings
+}
+
+// InspectContainerNetworks returns the map of attached network names to their active DNS aliases
+func (r *DockerRunner) InspectContainerNetworks(ctx context.Context, containerID string) (map[string][]string, error) {
+	if strings.HasPrefix(r.socket, "mock") || containerID == "" {
+		return nil, nil
+	}
+	u := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerID))
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("inspect container status %d", resp.StatusCode)
+	}
+
+	var data struct {
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	res := make(map[string][]string, len(data.NetworkSettings.Networks))
+	for netName, netCfg := range data.NetworkSettings.Networks {
+		res[netName] = slices.Clone(netCfg.Aliases)
+	}
+	return res, nil
+}
+
+// ListRunningContainers returns network and label summaries for running containers on the host
+func (r *DockerRunner) ListRunningContainers(ctx context.Context) ([]RunningContainerSummary, error) {
+	if strings.HasPrefix(r.socket, "mock") {
+		return nil, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/containers/json", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list containers status %d", resp.StatusCode)
+	}
+
+	var raw []struct {
+		ID              string            `json:"Id"`
+		Names           []string          `json:"Names"`
+		Labels          map[string]string `json:"Labels"`
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+
+	out := make([]RunningContainerSummary, 0, len(raw))
+	for _, item := range raw {
+		nets := make(map[string][]string, len(item.NetworkSettings.Networks))
+		for netName, netCfg := range item.NetworkSettings.Networks {
+			nets[netName] = slices.Clone(netCfg.Aliases)
+		}
+		names := make([]string, 0, len(item.Names))
+		for _, n := range item.Names {
+			names = append(names, strings.TrimPrefix(n, "/"))
+		}
+		out = append(out, RunningContainerSummary{
+			ID:       item.ID,
+			Names:    names,
+			Labels:   item.Labels,
+			Networks: nets,
+		})
+	}
+	return out, nil
+}
+
+func dedupeNonEmptyStrings(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" || slices.Contains(out, trimmed) {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func containsAllStrings(haystack, needles []string) bool {
+	for _, needle := range needles {
+		if !slices.Contains(haystack, needle) {
+			return false
+		}
+	}
+	return true
 }

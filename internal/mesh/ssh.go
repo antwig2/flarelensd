@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	OpenSSHConfigPath   = "/etc/ssh/sshd_config.d/99-flarelens-ssh.conf"
-	DefaultSSHKeyDir    = ".flarelens"
-	DefaultSSHKeyName   = "id_ed25519"
+	OpenSSHConfigPath = "/etc/ssh/sshd_config.d/99-flarelens-ssh.conf"
+	DefaultSSHKeyDir  = ".flarelens"
+	DefaultSSHKeyName = "id_ed25519"
 )
 
 // EnsureSSHKeypair checks for existing Ed25519 keypair or generates a new one

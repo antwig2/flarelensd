@@ -124,4 +124,3 @@ func LoadStateFromPath(p string) (*MeshState, error) {
 	}
 	return &state, nil
 }
-

@@ -340,4 +340,3 @@ func ParseWGDump(dump string) (map[string]PeerStats, error) {
 
 	return stats, nil
 }
-

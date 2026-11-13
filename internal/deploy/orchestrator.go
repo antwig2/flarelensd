@@ -5,13 +5,34 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antwig2/flarelens/internal/transport"
 )
+
+type targetDBContextKey struct{}
+
+// WithTargetDB attaches an optional target database name hint to ctx for pre-deploy snapshot/rollback hooks.
+func WithTargetDB(ctx context.Context, targetDB string) context.Context {
+	if strings.TrimSpace(targetDB) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, targetDBContextKey{}, strings.TrimSpace(targetDB))
+}
+
+// TargetDBFromContext retrieves an optional target database name hint from ctx.
+func TargetDBFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(targetDBContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // PreDeploySnapshotHook defines a callback executed before candidate container staging
 type PreDeploySnapshotHook func(ctx context.Context, service, tag string) error
@@ -33,6 +54,22 @@ type Orchestrator struct {
 	mu          sync.RWMutex
 	activeSlots map[string]Slot
 	nodeID      string
+	activeOps   atomic.Int32
+}
+
+// BeginOp increments the active orchestration operation counter (used by OTA drain lock).
+func (o *Orchestrator) BeginOp() {
+	o.activeOps.Add(1)
+}
+
+// EndOp decrements the active orchestration operation counter.
+func (o *Orchestrator) EndOp() {
+	o.activeOps.Add(-1)
+}
+
+// ActiveOps returns the number of currently executing Deploy or ReconcileSingleton operations.
+func (o *Orchestrator) ActiveOps() int32 {
+	return o.activeOps.Load()
 }
 
 func NewOrchestrator(
@@ -70,12 +107,21 @@ func (o *Orchestrator) SetRollbackHook(hook PreDeployRollbackHook) {
 
 // Deploy executes the complete 7-step zero-downtime Blue/Green deployment sequence
 func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResponse {
+	o.BeginOp()
+	defer o.EndOp()
 	startTime := time.Now()
 
 	// Guarantee pre-deploy snapshot whenever database migrations are requested
 	if req.RunMigrations {
 		req.PreDeploySnapshot = true
 	}
+
+	targetDB := cmp.Or(
+		strings.TrimSpace(req.TargetDB),
+		envValueByKeyOrSuffix(req.Secrets, "DB_NAME"),
+		envValueByKeyOrSuffix(req.Secrets, "POSTGRES_DB"),
+	)
+	hookCtx := WithTargetDB(ctx, targetDB)
 
 	o.logger.Info("Starting Blue/Green deployment",
 		"service", req.Service,
@@ -90,7 +136,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	if req.PreDeploySnapshot && o.preDeployHook != nil {
 		o.emitProgress(req, "backup", "Executing pre-deploy database snapshot guardrail...", 5)
 		snapshotTag := fmt.Sprintf("pre-deploy-%s", req.Service)
-		if err := o.preDeployHook(ctx, req.Service, snapshotTag); err != nil {
+		if err := o.preDeployHook(hookCtx, req.Service, snapshotTag); err != nil {
 			o.logger.Error("Pre-deploy database snapshot failed! Aborting deployment", "error", err)
 			return o.failResponse(req, "Pre-deploy snapshot guardrail failed: "+err.Error(), SlotBlue, startTime)
 		}
@@ -113,7 +159,10 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	}
 	if len(req.Networks) > 0 {
 		profile.Networks = req.Networks
+	} else if req.Network != "" {
+		profile.Networks = []string{req.Network}
 	}
+	profile.Aliases = ResolveServiceNetworkAliases(req.Service, envName, req.Aliases)
 	if len(req.Command) > 0 {
 		profile.Command = req.Command
 	}
@@ -201,28 +250,46 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		o.logger.Warn("No secrets provided in deploy request; using legacy host .env fallback files", "count", len(activeSecrets))
 	}
 
-	envList := make([]string, 0, len(activeSecrets)+6)
+	envList := make([]string, 0, len(activeSecrets)+8)
 	envList = append(envList,
 		fmt.Sprintf("DEPLOY_ENV=%s", envName),
 		fmt.Sprintf("DEPLOY_SLOT=%s", candidateSlot),
 		fmt.Sprintf("SERVICE_NAME=%s", baseServiceName),
-		fmt.Sprintf("APP_ENV=%s", envName),
-		"FEATURE_FLAGS_FILE=/etc/flarelens/flags/flags.json",
-		"FEATURE_FLAGS_URL=http://127.0.0.1:8999/api/v1/flags",
 	)
+	if !hasEnvKeyOrSuffix(activeSecrets, "APP_ENV") {
+		envList = append(envList, fmt.Sprintf("APP_ENV=%s", envName))
+	}
+	if !hasEnvKeyOrSuffix(activeSecrets, "SERVER_HOST") {
+		envList = append(envList, "SERVER_HOST=0.0.0.0")
+	}
+	if profile.ContainerPort > 0 && !hasEnvKeyOrSuffix(activeSecrets, "SERVER_PORT") {
+		envList = append(envList, fmt.Sprintf("SERVER_PORT=%d", profile.ContainerPort))
+	}
+	if !hasEnvKeyOrSuffix(activeSecrets, "FEATURE_FLAGS_FILE") {
+		envList = append(envList, "FEATURE_FLAGS_FILE=/etc/flarelens/flags/flags.json")
+	}
+	if !hasEnvKeyOrSuffix(activeSecrets, "FEATURE_FLAGS_URL") {
+		envList = append(envList, "FEATURE_FLAGS_URL=http://host.docker.internal:8999/api/v1/flags")
+	}
 	for k, v := range activeSecrets {
 		envList = append(envList, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	dbNetwork := fmt.Sprintf("%s-db", envName)
-	if len(profile.Networks) > 1 {
-		dbNetwork = profile.Networks[1]
+	if targetDB == "" {
+		targetDB = cmp.Or(
+			envValueByKeyOrSuffix(activeSecrets, "DB_NAME"),
+			envValueByKeyOrSuffix(activeSecrets, "POSTGRES_DB"),
+		)
+		hookCtx = WithTargetDB(ctx, targetDB)
 	}
+
+	dbNetwork := ResolveMigrationNetwork(envName, profile.Networks)
 
 	// 5. Execute Database Schema Migrations (in throwaway ephemeral container only when requested)
 	if req.RunMigrations {
 		migCmd := cmp.Or(req.MigrationCmd, profile.MigrationCmd)
 		if migCmd != "" {
+			_ = o.runner.EnsureNetwork(ctx, dbNetwork)
 			o.emitProgress(req, "migrating", fmt.Sprintf("Executing database schema migration: %s", migCmd), 25)
 			migrationOutput, err := o.migrator.Run(ctx, req.Image, migCmd, envList, dbNetwork)
 			if err != nil {
@@ -232,7 +299,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 				if req.PreDeploySnapshot && o.rollbackHook != nil {
 					o.emitProgress(req, "rollback", "Restoring database schema to pre-deploy snapshot...", 28)
 					snapshotTag := fmt.Sprintf("pre-deploy-%s", req.Service)
-					if rbErr := o.rollbackHook(ctx, req.Service, snapshotTag); rbErr != nil {
+					if rbErr := o.rollbackHook(hookCtx, req.Service, snapshotTag); rbErr != nil {
 						o.logger.Error("Failed to restore pre-deploy snapshot after migration error", "error", rbErr)
 					} else {
 						o.logger.Info("Database schema successfully rolled back to pre-deploy snapshot")
@@ -282,6 +349,15 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		}
 	}
 
+	candidateLabels := map[string]string{
+		"flarelens.service": baseServiceName,
+		"flarelens.slot":    string(candidateSlot),
+		"flarelens.env":     envName,
+	}
+	if !req.IsPreview && len(profile.Aliases) > 0 {
+		candidateLabels["flarelens.aliases"] = strings.Join(profile.Aliases, ",")
+	}
+
 	// 7. Create & Start Candidate Container with multi-network and secret volumes
 	containerID, err := o.runner.CreateContainerWithOptions(ctx, ContainerConfig{
 		Name:          candidateName,
@@ -293,11 +369,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		HostPort:      candidatePort,
 		ContainerPort: profile.ContainerPort,
 		Networks:      profile.Networks,
-		Labels: map[string]string{
-			"flarelens.service": baseServiceName,
-			"flarelens.slot":    string(candidateSlot),
-			"flarelens.env":     envName,
-		},
+		Labels:        candidateLabels,
 	})
 	if err != nil {
 		o.logger.Error("Failed to create candidate container", "error", err)
@@ -312,10 +384,16 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 
 	// 8. Healthcheck Probe Guardrail
 	probeHost, _ := o.runner.InspectContainerIP(ctx, containerID)
+	probePort := profile.ContainerPort
 	if probeHost == "" || probeHost == "127.0.0.1" {
-		probeHost = candidateName
+		if candidatePort > 0 {
+			probeHost = "127.0.0.1"
+			probePort = candidatePort
+		} else {
+			probeHost = candidateName
+		}
 	}
-	probeURL := fmt.Sprintf("http://%s:%d%s", probeHost, profile.ContainerPort, profile.HealthPath)
+	probeURL := fmt.Sprintf("http://%s:%d%s", probeHost, probePort, profile.HealthPath)
 	timeout := time.Duration(cmp.Or(req.TimeoutSeconds, 30)) * time.Second
 
 	o.emitProgress(req, "probing", fmt.Sprintf("Probing candidate health at %s (timeout: %s)", probeURL, timeout), 65)
@@ -406,7 +484,23 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		}
 	}
 
-	// 10. Zero-Downtime Traffic Switch in Traefik
+	// 10. Promote stable Docker DNS aliases onto healthy candidate before flipping live traffic
+	if len(profile.Aliases) > 0 {
+		if err := o.runner.PromoteNetworkAliases(ctx, containerID, profile.Networks, profile.Aliases); err != nil {
+			o.logger.Warn("Failed to promote Docker network aliases onto active candidate",
+				"container", candidateName,
+				"aliases", profile.Aliases,
+				"error", err,
+			)
+		} else {
+			o.logger.Info("Promoted stable Docker network aliases onto active candidate",
+				"container", candidateName,
+				"aliases", profile.Aliases,
+			)
+		}
+	}
+
+	// Zero-Downtime Traffic Switch in Traefik
 	o.emitProgress(req, "flipping", fmt.Sprintf("Candidate healthy! Atomically flipping live route to %s (%s)", candidateName, candidateSlot), 88)
 	if err := o.traefik.SwitchRoute(envName, baseServiceName, candidateName, profile.ContainerPort, req.Domain); err != nil {
 		o.logger.Warn("Traefik SwitchRoute warning, trying FlipRoute fallback", "error", err)
@@ -538,6 +632,7 @@ type ServiceProfile struct {
 	MigrationCmd  string
 	Volumes       []string
 	Networks      []string
+	Aliases       []string
 	Workers       []WorkerSpec
 }
 
@@ -549,6 +644,327 @@ func resolveServiceProfile(service, envName string) ServiceProfile {
 		HostPortGreen: 8082,
 		HealthPath:    "/healthz",
 		Networks:      []string{"flarelens-edge"},
+		Aliases:       ResolveServiceNetworkAliases(service, envName, nil),
+	}
+}
+
+func normalizeEnvShort(envName string) string {
+	e := strings.ToLower(strings.TrimSpace(envName))
+	switch e {
+	case "":
+		return "uat"
+	case "production":
+		return "prod"
+	default:
+		return e
+	}
+}
+
+func canonicalServiceName(service string) string {
+	s := strings.ToLower(strings.TrimSpace(service))
+	for _, suffix := range []string{"-production", "-prod", "-uat", "-staging"} {
+		if strings.HasSuffix(s, suffix) && len(s) > len(suffix) {
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+	return s
+}
+
+// ResolveServiceNetworkAliases computes canonical Docker DNS aliases plus any manifest-defined aliases for a service.
+func ResolveServiceNetworkAliases(service, envName string, explicit []string) []string {
+	envShort := normalizeEnvShort(envName)
+	clean := canonicalServiceName(service)
+	if clean == "" {
+		return dedupeNonEmptyStrings(explicit)
+	}
+
+	aliases := []string{
+		clean,
+		fmt.Sprintf("%s-%s", clean, envShort),
+	}
+
+	// Dragonfly is a drop-in Redis protocol engine; expose standard redis DNS aliases automatically.
+	if clean == "dragonfly" {
+		aliases = append(aliases, "redis", fmt.Sprintf("redis-%s", envShort))
+	}
+
+	aliases = append(aliases, explicit...)
+	return dedupeNonEmptyStrings(aliases)
+}
+
+// ResolveMigrationNetwork selects the internal database-reachable Docker network rather than edge-only networks.
+func ResolveMigrationNetwork(envName string, networks []string) string {
+	envShort := normalizeEnvShort(envName)
+	preferred := []string{
+		envShort,
+		fmt.Sprintf("%s-db", envShort),
+	}
+	for _, want := range preferred {
+		if slices.Contains(networks, want) {
+			return want
+		}
+	}
+	// Prefer networks scoped to the target environment (e.g. "<stack>-uat", "<stack>-prod")
+	for _, netName := range networks {
+		trimmed := strings.TrimSpace(netName)
+		lower := strings.ToLower(trimmed)
+		if trimmed != "" && !strings.HasSuffix(lower, "-edge") &&
+			(strings.HasSuffix(lower, "-"+envShort) || strings.HasSuffix(lower, "_"+envShort)) {
+			return trimmed
+		}
+	}
+	for _, netName := range networks {
+		trimmed := strings.TrimSpace(netName)
+		if trimmed != "" && !strings.HasSuffix(strings.ToLower(trimmed), "-edge") {
+			return trimmed
+		}
+	}
+	for _, netName := range networks {
+		if trimmed := strings.TrimSpace(netName); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "flarelens-edge"
+}
+
+func hasEnvKeyOrSuffix(envMap map[string]string, suffix string) bool {
+	return envValueByKeyOrSuffix(envMap, suffix) != ""
+}
+
+func envValueByKeyOrSuffix(envMap map[string]string, suffix string) string {
+	if len(envMap) == 0 || suffix == "" {
+		return ""
+	}
+	wantUpper := strings.ToUpper(suffix)
+	if v, ok := envMap[wantUpper]; ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	keys := slices.Sorted(maps.Keys(envMap))
+	for _, k := range keys {
+		upper := strings.ToUpper(strings.TrimSpace(k))
+		if upper == wantUpper || strings.HasSuffix(upper, "_"+wantUpper) {
+			if val := strings.TrimSpace(envMap[k]); val != "" {
+				return val
+			}
+		}
+	}
+	return ""
+}
+
+// ReconcileActiveAliases inspects running containers on agent startup and ensures active slots and stateful services
+// expose their stable Docker DNS aliases without requiring a full redeploy.
+func (o *Orchestrator) ReconcileActiveAliases(ctx context.Context) {
+	containers, err := o.runner.ListRunningContainers(ctx)
+	if err != nil || len(containers) == 0 {
+		return
+	}
+
+	type slotCandidate struct {
+		containerID     string
+		name            string
+		service         string
+		envName         string
+		slot            Slot
+		networks        []string
+		explicitAliases []string
+		hasAlias        bool
+	}
+
+	byService := make(map[string][]slotCandidate)
+
+	for _, c := range containers {
+		if c.Labels["flarelens.worker"] != "" {
+			continue
+		}
+		primaryName := ""
+		if len(c.Names) > 0 {
+			primaryName = c.Names[0]
+		}
+		lowerName := strings.ToLower(primaryName)
+		if strings.Contains(lowerName, "-pr-") ||
+			strings.Contains(lowerName, "worker") ||
+			strings.Contains(lowerName, "drainer") ||
+			strings.Contains(lowerName, "benthos") ||
+			strings.Contains(lowerName, "traefik") ||
+			strings.Contains(lowerName, "cloudflared") {
+			continue
+		}
+
+		targetNets := make([]string, 0, len(c.Networks))
+		for netName := range maps.Keys(c.Networks) {
+			if netName == "" || netName == "bridge" || netName == "host" || netName == "none" {
+				continue
+			}
+			targetNets = append(targetNets, netName)
+		}
+		slices.Sort(targetNets)
+		if len(targetNets) == 0 {
+			continue
+		}
+
+		envName := strings.ToLower(strings.TrimSpace(c.Labels["flarelens.env"]))
+		if envName == "" {
+			for _, netName := range targetNets {
+				lowerNet := strings.ToLower(netName)
+				switch {
+				case lowerNet == "prod" || lowerNet == "production" || strings.HasSuffix(lowerNet, "-prod") || strings.HasSuffix(lowerNet, "-production"):
+					envName = "prod"
+				case lowerNet == "staging" || strings.HasSuffix(lowerNet, "-staging"):
+					envName = "staging"
+				case lowerNet == "uat" || strings.HasSuffix(lowerNet, "-uat"):
+					envName = "uat"
+				}
+				if envName != "" {
+					break
+				}
+			}
+		}
+		if envName == "" {
+			if strings.Contains(lowerName, "-prod-") || strings.HasSuffix(lowerName, "-prod") {
+				envName = "prod"
+			} else {
+				envName = "uat"
+			}
+		}
+
+		var labelAliases []string
+		if rawAliases := strings.TrimSpace(c.Labels["flarelens.aliases"]); rawAliases != "" {
+			labelAliases = dedupeNonEmptyStrings(strings.Split(rawAliases, ","))
+		}
+
+		if c.Labels["flarelens.mode"] == "singleton" {
+			svc := cmp.Or(strings.TrimSpace(c.Labels["flarelens.service"]), primaryName)
+			aliases := ResolveServiceNetworkAliases(svc, envName, labelAliases)
+			if err := o.runner.PromoteNetworkAliases(ctx, c.ID, targetNets, aliases); err != nil {
+				o.logger.Warn("Startup alias reconciliation warning for singleton container",
+					"container", primaryName,
+					"error", err,
+				)
+			}
+			continue
+		}
+
+		// Reconcile stateful foundation services (postgres, dragonfly/redis)
+		statefulService := ""
+		switch {
+		case strings.Contains(lowerName, "postgres"):
+			statefulService = "postgres"
+		case strings.Contains(lowerName, "dragonfly") || strings.Contains(lowerName, "redis"):
+			statefulService = "dragonfly"
+		}
+		if statefulService != "" {
+			extra := slices.Clone(labelAliases)
+			if primaryName != "" {
+				extra = append(extra, primaryName)
+			}
+			aliases := ResolveServiceNetworkAliases(statefulService, envName, extra)
+			if err := o.runner.PromoteNetworkAliases(ctx, c.ID, targetNets, aliases); err != nil {
+				o.logger.Warn("Startup alias reconciliation warning for stateful container",
+					"container", primaryName,
+					"error", err,
+				)
+			}
+			continue
+		}
+
+		service := strings.TrimSpace(c.Labels["flarelens.service"])
+		slotStr := strings.ToLower(strings.TrimSpace(c.Labels["flarelens.slot"]))
+		if strings.HasPrefix(slotStr, "pr-") {
+			continue
+		}
+		if slotStr != string(SlotBlue) && slotStr != string(SlotGreen) {
+			switch {
+			case strings.HasSuffix(lowerName, "-blue"):
+				slotStr = string(SlotBlue)
+				if service == "" {
+					service = strings.TrimSuffix(primaryName, "-blue")
+				}
+			case strings.HasSuffix(lowerName, "-green"):
+				slotStr = string(SlotGreen)
+				if service == "" {
+					service = strings.TrimSuffix(primaryName, "-green")
+				}
+			default:
+				continue
+			}
+		}
+		if service == "" {
+			continue
+		}
+
+		canon := canonicalServiceName(service)
+		alreadyAliased := false
+		for _, aliases := range c.Networks {
+			if slices.Contains(aliases, canon) {
+				alreadyAliased = true
+				break
+			}
+		}
+
+		byService[service] = append(byService[service], slotCandidate{
+			containerID:     c.ID,
+			name:            primaryName,
+			service:         service,
+			envName:         envName,
+			slot:            Slot(slotStr),
+			networks:        targetNets,
+			explicitAliases: labelAliases,
+			hasAlias:        alreadyAliased,
+		})
+	}
+
+	for service, candidates := range byService {
+		chosen := candidates[0]
+		if len(candidates) > 1 {
+			o.mu.RLock()
+			knownSlot, hasKnown := o.activeSlots[service]
+			o.mu.RUnlock()
+
+			selected := false
+			if hasKnown {
+				for _, cand := range candidates {
+					if cand.slot == knownSlot {
+						chosen = cand
+						selected = true
+						break
+					}
+				}
+			}
+			if !selected {
+				for _, cand := range candidates {
+					if cand.hasAlias {
+						chosen = cand
+						selected = true
+						break
+					}
+				}
+			}
+			if !selected {
+				for _, cand := range candidates {
+					if cand.slot == SlotGreen {
+						chosen = cand
+						break
+					}
+				}
+			}
+		}
+
+		aliases := ResolveServiceNetworkAliases(chosen.service, chosen.envName, chosen.explicitAliases)
+		if err := o.runner.PromoteNetworkAliases(ctx, chosen.containerID, chosen.networks, aliases); err != nil {
+			o.logger.Warn("Startup alias reconciliation warning",
+				"service", chosen.service,
+				"container", chosen.name,
+				"error", err,
+			)
+			continue
+		}
+
+		o.mu.Lock()
+		if _, exists := o.activeSlots[service]; !exists {
+			o.activeSlots[service] = chosen.slot
+		}
+		o.mu.Unlock()
 	}
 }
 

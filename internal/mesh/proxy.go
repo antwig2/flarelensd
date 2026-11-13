@@ -10,15 +10,16 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	socks5Version = 0x05
-	socks5AuthNone = 0x00
-	socks5AuthUserPass = 0x02
+	socks5Version          = 0x05
+	socks5AuthNone         = 0x00
+	socks5AuthUserPass     = 0x02
 	socks5AuthNoAcceptable = 0xFF
 
 	socks5CmdConnect = 0x01
@@ -35,12 +36,12 @@ const (
 
 // ProxyConfig defines settings for the in-memory zero-root SOCKS5 & HTTP CONNECT proxy
 type ProxyConfig struct {
-	ListenAddr    string        // e.g. "127.0.0.1:1055"
-	Username      string        // optional username for authentication
-	Password      string        // optional password for authentication
-	DialTimeout   time.Duration // default: 5s
-	AllowLAN      bool          // if true, allows binding to non-loopback addresses
-	DNSResolver   *MagicDNSServer // optional resolver for .mesh domains
+	ListenAddr  string          // e.g. "127.0.0.1:1055"
+	Username    string          // optional username for authentication
+	Password    string          // optional password for authentication
+	DialTimeout time.Duration   // default: 5s
+	AllowLAN    bool            // if true, allows binding to non-loopback addresses
+	DNSResolver *MagicDNSServer // optional resolver for .mesh domains
 }
 
 // ProxyServer runs an unprivileged SOCKS5 and HTTP CONNECT proxy server
@@ -277,7 +278,7 @@ func (s *ProxyServer) handleSOCKS5(reader *bufio.Reader, clientConn net.Conn) {
 
 	// 4. Resolve domain name (with MagicDNS resolution for *.mesh)
 	resolvedHost := s.resolveTargetHost(targetHost)
-	targetAddr := fmt.Sprintf("%s:%d", resolvedHost, targetPort)
+	targetAddr := net.JoinHostPort(resolvedHost, strconv.Itoa(int(targetPort)))
 
 	// 5. Dial target
 	targetConn, err := net.DialTimeout("tcp", targetAddr, s.cfg.DialTimeout)
@@ -394,7 +395,7 @@ func (s *ProxyServer) handleHTTP(reader *bufio.Reader, clientConn net.Conn) {
 	}
 
 	resolvedHost := s.resolveTargetHost(targetHost)
-	targetAddr := fmt.Sprintf("%s:%s", resolvedHost, targetPortStr)
+	targetAddr := net.JoinHostPort(resolvedHost, targetPortStr)
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, s.cfg.DialTimeout)
 	if err != nil {
