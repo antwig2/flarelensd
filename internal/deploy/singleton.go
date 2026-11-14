@@ -73,7 +73,10 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		}
 	}
 
-	aliases := ResolveServiceNetworkAliases(service, envName, append(slices.Clone(spec.Aliases), containerName))
+	var aliases []string
+	if !slices.Contains(networks, "host") && !slices.Contains(networks, "none") {
+		aliases = ResolveServiceNetworkAliases(service, envName, append(slices.Clone(spec.Aliases), containerName))
+	}
 	specHash := computeSingletonSpecHash(spec, envName, networks, aliases)
 
 	existing, err := o.runner.InspectContainerDetail(ctx, containerName)

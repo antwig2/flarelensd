@@ -272,6 +272,15 @@ func (r *DockerRunner) EnsureNetwork(ctx context.Context, networkName string) er
 	return nil
 }
 
+func isSpecialDockerNetwork(networkName string) bool {
+	switch strings.TrimSpace(networkName) {
+	case "host", "none", "bridge":
+		return true
+	default:
+		return false
+	}
+}
+
 // ConnectNetwork attaches an existing container to a Docker network
 func (r *DockerRunner) ConnectNetwork(ctx context.Context, containerID string, networkName string) error {
 	return r.ConnectNetworkWithAliases(ctx, containerID, networkName, nil)
@@ -279,7 +288,7 @@ func (r *DockerRunner) ConnectNetwork(ctx context.Context, containerID string, n
 
 // ConnectNetworkWithAliases attaches an existing container to a Docker network with optional DNS aliases
 func (r *DockerRunner) ConnectNetworkWithAliases(ctx context.Context, containerID string, networkName string, aliases []string) error {
-	if strings.HasPrefix(r.socket, "mock") || networkName == "" {
+	if strings.HasPrefix(r.socket, "mock") || networkName == "" || networkName == "host" || networkName == "none" {
 		return nil
 	}
 	_ = r.EnsureNetwork(ctx, networkName)
@@ -288,7 +297,7 @@ func (r *DockerRunner) ConnectNetworkWithAliases(ctx context.Context, containerI
 	payload := map[string]any{
 		"Container": containerID,
 	}
-	if len(aliases) > 0 {
+	if len(aliases) > 0 && !isSpecialDockerNetwork(networkName) {
 		payload["EndpointConfig"] = networkEndpointConfig{
 			Aliases: dedupeNonEmptyStrings(aliases),
 		}
@@ -369,6 +378,9 @@ func (r *DockerRunner) PromoteNetworkAliases(ctx context.Context, containerID st
 	existingNets, _ := r.InspectContainerNetworks(ctx, containerID)
 
 	for _, netName := range targetNetworks {
+		if isSpecialDockerNetwork(netName) {
+			continue
+		}
 		existingAliases, connected := existingNets[netName]
 		if connected && containsAllStrings(existingAliases, cleanAliases) {
 			continue
@@ -394,7 +406,12 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 	}
 	_ = r.EnsureNetwork(ctx, primaryNetwork)
 
-	extraHosts := dedupeNonEmptyStrings(append([]string{"host.docker.internal:host-gateway"}, cfg.ExtraHosts...))
+	var extraHosts []string
+	if primaryNetwork != "host" && primaryNetwork != "none" {
+		extraHosts = dedupeNonEmptyStrings(append([]string{"host.docker.internal:host-gateway"}, cfg.ExtraHosts...))
+	} else if len(cfg.ExtraHosts) > 0 {
+		extraHosts = dedupeNonEmptyStrings(cfg.ExtraHosts)
+	}
 
 	createCfg := containerCreateConfig{
 		Image:       cfg.Image,
@@ -414,7 +431,7 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 		},
 	}
 
-	if cleanAliases := dedupeNonEmptyStrings(cfg.Aliases); len(cleanAliases) > 0 {
+	if cleanAliases := dedupeNonEmptyStrings(cfg.Aliases); len(cleanAliases) > 0 && !isSpecialDockerNetwork(primaryNetwork) {
 		createCfg.NetworkingConfig = &containerNetworkingConfig{
 			EndpointsConfig: map[string]networkEndpointConfig{
 				primaryNetwork: {
@@ -477,10 +494,10 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 		return "", err
 	}
 
-	// Connect to secondary networks (e.g. uat or prod)
-	if len(cfg.Networks) > 1 {
+	// Connect to secondary networks (e.g. uat or prod) when primary network is a bridge/overlay network
+	if len(cfg.Networks) > 1 && primaryNetwork != "host" && primaryNetwork != "none" {
 		for _, netName := range cfg.Networks[1:] {
-			if netName != "" && netName != primaryNetwork {
+			if netName != "" && netName != primaryNetwork && netName != "host" && netName != "none" {
 				if err := r.ConnectNetworkWithAliases(ctx, result.ID, netName, cfg.Aliases); err != nil {
 					_ = r.RemoveContainer(ctx, result.ID)
 					return "", err

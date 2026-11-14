@@ -495,6 +495,10 @@ func TestDeployPromotesAliasesAfterHealthcheckAndReconcilesStartup(t *testing.T)
 		}
 		if strings.HasSuffix(path, "/connect") {
 			netName := strings.TrimSuffix(path, "/connect")
+			if netName == "host" || netName == "none" {
+				http.Error(w, "cannot attach container to special network "+netName, http.StatusBadRequest)
+				return
+			}
 			var body struct {
 				Container      string                `json:"Container"`
 				EndpointConfig networkEndpointConfig `json:"EndpointConfig"`
@@ -763,6 +767,10 @@ func TestReconcileSingletonCreatesHealsAndProtectsStateful(t *testing.T) {
 		}
 		if strings.HasSuffix(path, "/connect") {
 			netName := strings.TrimSuffix(path, "/connect")
+			if netName == "host" || netName == "none" {
+				http.Error(w, "cannot attach container to special network "+netName, http.StatusBadRequest)
+				return
+			}
 			var body struct {
 				Container      string                `json:"Container"`
 				EndpointConfig networkEndpointConfig `json:"EndpointConfig"`
@@ -783,6 +791,10 @@ func TestReconcileSingletonCreatesHealsAndProtectsStateful(t *testing.T) {
 		var cfg containerCreateConfig
 		_ = json.NewDecoder(r.Body).Decode(&cfg)
 		primaryNet := cfg.HostConfig.NetworkMode
+		if (primaryNet == "host" || primaryNet == "none" || primaryNet == "bridge") && cfg.NetworkingConfig != nil {
+			http.Error(w, "network-scoped alias is supported only for containers in user defined networks", http.StatusBadRequest)
+			return
+		}
 		var initAliases []string
 		if cfg.NetworkingConfig != nil {
 			initAliases = slices.Clone(cfg.NetworkingConfig.EndpointsConfig[primaryNet].Aliases)
@@ -963,5 +975,43 @@ func TestReconcileSingletonCreatesHealsAndProtectsStateful(t *testing.T) {
 	mu.Unlock()
 	if stopsAfterUpdate != 1 || currentImage != "invalid.local/org/benthos:v2" {
 		t.Errorf("Expected stateless singleton to recreate onto v2 (stops=%d, image=%s)", stopsAfterUpdate, currentImage)
+	}
+
+	// 3. Host-networked singleton (e.g. ingress tunnel daemon) omits bridge aliases & extra host-gateway
+	hostSpec := SingletonSpec{
+		DeploymentID:  "sing-tunnel-1",
+		Service:       "tunnel-connector",
+		Env:           "infra",
+		Image:         "invalid.local/edge/connector:v1",
+		ContainerName: "infra-tunnel-connector",
+		Restart:       "always",
+		Networks:      []string{"host"},
+		Command:       []string{"tunnel", "--no-autoupdate", "run"},
+		Secrets:       map[string]string{"TUNNEL_TOKEN": "tok-123"},
+	}
+	rHost := orch.ReconcileSingleton(t.Context(), hostSpec)
+	if rHost.Status != "success" {
+		t.Fatalf("Expected host-network singleton reconcile success, got %s: %s", rHost.Status, rHost.Message)
+	}
+	mu.Lock()
+	hostCtr := containers["infra-tunnel-connector"]
+	hostNetMode := hostCtr.cfg.HostConfig.NetworkMode
+	hostExtra := slices.Clone(hostCtr.cfg.HostConfig.ExtraHosts)
+	mu.Unlock()
+	if hostNetMode != "host" {
+		t.Errorf("Expected NetworkMode=host, got %q", hostNetMode)
+	}
+	if len(hostExtra) != 0 {
+		t.Errorf("Expected no host.docker.internal extra host on host network, got %v", hostExtra)
+	}
+	rHostNoop := orch.ReconcileSingleton(t.Context(), hostSpec)
+	if rHostNoop.Status != "success" {
+		t.Fatalf("Expected idempotent host-network singleton re-reconcile success, got %s: %s", rHostNoop.Status, rHostNoop.Message)
+	}
+	mu.Lock()
+	stopsAfterHostNoop := len(stoppedIDs)
+	mu.Unlock()
+	if stopsAfterHostNoop != 1 {
+		t.Errorf("Expected zero additional stops on host-network idempotent re-reconcile, got total stops=%d", stopsAfterHostNoop)
 	}
 }
