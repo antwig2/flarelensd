@@ -52,8 +52,12 @@ type Orchestrator struct {
 	rollbackHook  PreDeployRollbackHook
 	migrator      *MigrationRunner
 
+	extraHostsFn      func(env string) []string
+	remoteUpstreamsFn func(env, service string) []string
+
 	mu          sync.RWMutex
 	activeSlots map[string]Slot
+	activePorts map[string]int
 	nodeID      string
 	activeOps   atomic.Int32
 }
@@ -91,9 +95,41 @@ func NewOrchestrator(
 		natsClient:  natsClient,
 		logger:      logger,
 		activeSlots: make(map[string]Slot),
+		activePorts: make(map[string]int),
 		nodeID:      nodeID,
 		migrator:    NewMigrationRunner(logger),
 	}
+}
+
+// SetMeshRoutingHooks wires WireGuard cross-node ExtraHosts and multi-node Traefik upstream lookups.
+func (o *Orchestrator) SetMeshRoutingHooks(
+	extraHostsFn func(env string) []string,
+	remoteUpstreamsFn func(env, service string) []string,
+) {
+	o.mu.Lock()
+	o.extraHostsFn = extraHostsFn
+	o.remoteUpstreamsFn = remoteUpstreamsFn
+	o.mu.Unlock()
+}
+
+func (o *Orchestrator) extraHostsForEnv(env string) []string {
+	o.mu.RLock()
+	fn := o.extraHostsFn
+	o.mu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(env)
+}
+
+func (o *Orchestrator) remoteUpstreamsForService(env, service string) []string {
+	o.mu.RLock()
+	fn := o.remoteUpstreamsFn
+	o.mu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(env, service)
 }
 
 // SetPreDeployHook registers a pre-deploy backup guardrail hook
@@ -331,6 +367,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	}
 
 	dbNetwork := ResolveMigrationNetwork(envName, profile.Networks)
+	mergedExtraHosts := dedupeNonEmptyStrings(append(slices.Clone(req.ExtraHosts), o.extraHostsForEnv(envName)...))
 
 	// 5. Execute Database Schema Migrations (in throwaway ephemeral container only when requested)
 	if req.RunMigrations {
@@ -338,7 +375,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		if migCmd != "" {
 			_ = o.runner.EnsureNetwork(ctx, dbNetwork)
 			o.emitProgress(req, "migrating", fmt.Sprintf("Executing database schema migration: %s", migCmd), 25)
-			migrationOutput, err := o.migrator.Run(ctx, req.Image, migCmd, envList, dbNetwork, resolvedBinds...)
+			migrationOutput, err := o.migrator.RunWithExtraHosts(ctx, req.Image, migCmd, envList, dbNetwork, mergedExtraHosts, resolvedBinds...)
 			if err != nil {
 				o.logger.Error("Database schema migration failed! Aborting deployment", "error", err, "output", migrationOutput)
 
@@ -401,6 +438,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		Cmd:           profile.Command,
 		Entrypoint:    profile.Entrypoint,
 		Binds:         resolvedBinds,
+		ExtraHosts:    mergedExtraHosts,
 		HostPort:      candidatePort,
 		ContainerPort: profile.ContainerPort,
 		Networks:      profile.Networks,
@@ -537,25 +575,37 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		}
 	}
 
-	// Zero-Downtime Traffic Switch in Traefik
+	// Zero-Downtime Traffic Switch in Traefik (supports both single-node and multi-node WireGuard mesh pools)
+	mergedRemoteUpstreams := dedupeNonEmptyStrings(append(slices.Clone(req.RemoteUpstreams), o.remoteUpstreamsForService(envName, baseServiceName)...))
 	o.emitProgress(req, "flipping", fmt.Sprintf("Candidate healthy! Atomically flipping live route to %s (%s)", candidateName, candidateSlot), 88)
-	if err := o.traefik.SwitchRouteWithDomains(envName, baseServiceName, candidateName, profile.ContainerPort, effectiveDomains, profile.Aliases...); err != nil {
+	if len(mergedRemoteUpstreams) > 0 && len(effectiveDomains) > 0 {
+		localUpstream := fmt.Sprintf("http://127.0.0.1:%d", candidatePort)
+		if candidatePort <= 0 {
+			localUpstream = fmt.Sprintf("http://%s:%d", candidateName, profile.ContainerPort)
+		}
+		allUpstreams := append([]string{localUpstream}, mergedRemoteUpstreams...)
+		if err := o.traefik.SyncMultiNodeRoute(envName, baseServiceName, effectiveDomains, allUpstreams, profile.HealthPath); err != nil {
+			o.logger.Warn("Traefik multi-node route sync warning, falling back to local SwitchRoute", "error", err)
+			_ = o.traefik.SwitchRouteWithDomains(envName, baseServiceName, candidateName, profile.ContainerPort, effectiveDomains, profile.Aliases...)
+		}
+	} else if err := o.traefik.SwitchRouteWithDomains(envName, baseServiceName, candidateName, profile.ContainerPort, effectiveDomains, profile.Aliases...); err != nil {
 		o.logger.Warn("Traefik SwitchRoute warning, trying FlipRoute fallback", "error", err)
 		if len(effectiveDomains) > 0 {
 			_ = o.traefik.FlipRouteWithDomains(candidateName, effectiveDomains, candidatePort)
 		}
 	}
 
-	// Update active slot in memory
+	// Update active slot and active host port in memory
 	o.mu.Lock()
 	o.activeSlots[req.Service] = candidateSlot
+	o.activePorts[fmt.Sprintf("%s:%s", envName, baseServiceName)] = candidatePort
 	o.mu.Unlock()
 
 	// 11. Companion Workers Rollout (Kamal-style)
 	for _, worker := range profile.Workers {
 		workerName := fmt.Sprintf("%s-%s", worker.Name, envName)
 		o.emitProgress(req, "worker", fmt.Sprintf("Rolling out companion worker: %s", workerName), 92)
-		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles)
+		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles, mergedExtraHosts)
 	}
 
 	// 12. Drain, stop, and remove previous web slot(s) (both canonical and legacy pre-GitOps slots)
@@ -614,6 +664,7 @@ func (o *Orchestrator) rolloutWorker(
 	baseServiceName string,
 	envName string,
 	secretFiles map[string]string,
+	extraHosts []string,
 ) {
 	workerNets := worker.Networks
 	if len(workerNets) == 0 {
@@ -652,10 +703,12 @@ func (o *Orchestrator) rolloutWorker(
 		Cmd:        worker.Command,
 		Entrypoint: worker.Entrypoint,
 		Binds:      resolvedWorkerBinds,
+		ExtraHosts: extraHosts,
 		Networks:   workerNets,
 		Labels: map[string]string{
-			"flarelens.worker": worker.Name,
-			"flarelens.env":    envName,
+			"flarelens.worker":  worker.Name,
+			"flarelens.service": baseServiceName,
+			"flarelens.env":     envName,
 		},
 	})
 	if err != nil {
@@ -1572,4 +1625,169 @@ func selectRAMSecretsBaseDir() string {
 		}
 	}
 	return filepath.Join(os.TempDir(), "flarelens-secrets")
+}
+
+// SyncRemoteOnlyRoute configures local Traefik to load-balance across remote mesh replicas when no local replica runs on this node.
+func (o *Orchestrator) SyncRemoteOnlyRoute(env, service string, domains []string, remoteURLs []string, healthPath string) error {
+	if o.traefik == nil || len(domains) == 0 || len(remoteURLs) == 0 {
+		return nil
+	}
+	envShort := normalizeEnvShort(env)
+	baseSvc := canonicalServiceName(service)
+	return o.traefik.SyncMultiNodeRoute(envShort, baseSvc, domains, remoteURLs, healthPath)
+}
+
+// ResolveLocalEndpointTarget resolves a local TCP "host:port" for WireGuard mesh service forwarding.
+func (o *Orchestrator) ResolveLocalEndpointTarget(
+	ctx context.Context,
+	env, service, mode, containerName string,
+	containerPort, fallbackHostPort int,
+) (string, error) {
+	envShort := normalizeEnvShort(env)
+	baseSvc := canonicalServiceName(service)
+
+	if mode == "singleton" {
+		targetName := cmp.Or(strings.TrimSpace(containerName), fmt.Sprintf("%s-%s", baseSvc, envShort), baseSvc)
+		if ip, err := o.runner.InspectContainerIP(ctx, targetName); err == nil && ip != "" && ip != "127.0.0.1" && containerPort > 0 {
+			return fmt.Sprintf("%s:%d", ip, containerPort), nil
+		}
+		if fallbackHostPort > 0 {
+			return fmt.Sprintf("127.0.0.1:%d", fallbackHostPort), nil
+		}
+		if containerPort > 0 {
+			return fmt.Sprintf("127.0.0.1:%d", containerPort), nil
+		}
+		return "", fmt.Errorf("no local port resolved for singleton %s", targetName)
+	}
+
+	o.mu.RLock()
+	activePort := o.activePorts[fmt.Sprintf("%s:%s", envShort, baseSvc)]
+	activeSlot := o.activeSlots[service]
+	if activeSlot == "" {
+		activeSlot = o.activeSlots[baseSvc]
+	}
+	o.mu.RUnlock()
+
+	if activePort > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", activePort), nil
+	}
+
+	candidates := []string{
+		fmt.Sprintf("%s-%s", service, cmp.Or(string(activeSlot), "blue")),
+		fmt.Sprintf("%s-blue", service),
+		fmt.Sprintf("%s-green", service),
+		fmt.Sprintf("%s-%s-blue", baseSvc, envShort),
+		fmt.Sprintf("%s-%s-green", baseSvc, envShort),
+	}
+	for _, name := range dedupeNonEmptyStrings(candidates) {
+		detail, err := o.runner.InspectContainerDetail(ctx, name)
+		if err == nil && detail != nil && detail.Running {
+			if ip, ipErr := o.runner.InspectContainerIP(ctx, detail.ID); ipErr == nil && ip != "" && containerPort > 0 {
+				return fmt.Sprintf("%s:%d", ip, containerPort), nil
+			}
+		}
+	}
+
+	if fallbackHostPort > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", fallbackHostPort), nil
+	}
+	return "", fmt.Errorf("no running local replica found for %s/%s", envShort, baseSvc)
+}
+
+// DecommissionService gracefully drains and removes stateless service containers evicted during scale-down or Node Drain.
+func (o *Orchestrator) DecommissionService(ctx context.Context, req DecommissionRequest) DeployResponse {
+	o.BeginOp()
+	defer o.EndOp()
+	startTime := time.Now()
+
+	envShort := normalizeEnvShort(req.Env)
+	baseSvc := canonicalServiceName(req.Service)
+	if baseSvc == "" {
+		return DeployResponse{
+			DeploymentID: req.DeploymentID,
+			Service:      req.Service,
+			Status:       "failed",
+			Message:      "decommission_service requires non-empty service name",
+			DurationMS:   time.Since(startTime).Milliseconds(),
+		}
+	}
+
+	if isStatefulProtected(baseSvc, req.ContainerName) && !req.ForceRemoveStateful {
+		return DeployResponse{
+			DeploymentID: req.DeploymentID,
+			Service:      req.Service,
+			Status:       "skipped",
+			Message:      fmt.Sprintf("Fenced stateful workload %s preserved on node (volumes untouched)", cmp.Or(req.ContainerName, baseSvc)),
+			DurationMS:   time.Since(startTime).Milliseconds(),
+		}
+	}
+
+	// 1. Repoint Traefik to surviving remote mesh replicas BEFORE stopping local containers so zero requests drop!
+	remoteURLs := dedupeNonEmptyStrings(append(slices.Clone(req.RemoteUpstreams), o.remoteUpstreamsForService(envShort, baseSvc)...))
+	if o.traefik != nil {
+		if len(remoteURLs) > 0 && len(req.Domains) > 0 {
+			_ = o.traefik.SyncMultiNodeRoute(envShort, baseSvc, req.Domains, remoteURLs, req.HealthPath)
+		} else {
+			_ = o.traefik.RemoveRoute(fmt.Sprintf("%s-%s", envShort, baseSvc))
+			_ = o.traefik.RemoveRoute(baseSvc)
+		}
+	}
+
+	drainSec := min(max(req.DrainSeconds, 0), 30)
+	if drainSec > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(drainSec) * time.Second):
+		}
+	}
+
+	removed := make([]string, 0, 4)
+	candidateNames := dedupeNonEmptyStrings([]string{
+		req.ContainerName,
+		fmt.Sprintf("%s-blue", req.Service),
+		fmt.Sprintf("%s-green", req.Service),
+		fmt.Sprintf("%s-%s-blue", baseSvc, envShort),
+		fmt.Sprintf("%s-%s-green", baseSvc, envShort),
+	})
+
+	for _, name := range candidateNames {
+		if id, _ := o.runner.FindContainerIDByName(ctx, name); id != "" {
+			_ = o.runner.StopContainer(ctx, id, 10)
+			if err := o.runner.RemoveContainer(ctx, id); err == nil {
+				removed = append(removed, name)
+			}
+		}
+	}
+
+	if allCtrs, err := o.runner.ListAllContainers(ctx); err == nil {
+		for _, c := range allCtrs {
+			lblSvc := canonicalServiceName(c.Labels["flarelens.service"])
+			lblEnv := normalizeEnvShort(c.Labels["flarelens.env"])
+			if lblSvc == baseSvc && lblEnv == envShort {
+				if isStatefulProtected(baseSvc, firstNonEmpty(c.Names)) && !req.ForceRemoveStateful {
+					continue
+				}
+				_ = o.runner.StopContainer(ctx, c.ID, 10)
+				if err := o.runner.RemoveContainer(ctx, c.ID); err == nil {
+					if n := firstNonEmpty(c.Names); n != "" && !slices.Contains(removed, n) {
+						removed = append(removed, n)
+					}
+				}
+			}
+		}
+	}
+
+	o.mu.Lock()
+	delete(o.activeSlots, req.Service)
+	delete(o.activeSlots, baseSvc)
+	delete(o.activePorts, fmt.Sprintf("%s:%s", envShort, baseSvc))
+	o.mu.Unlock()
+
+	return DeployResponse{
+		DeploymentID: req.DeploymentID,
+		Service:      req.Service,
+		Status:       "success",
+		Message:      fmt.Sprintf("Decommissioned %s (%s); removed %d container(s): %s", req.Service, envShort, len(removed), strings.Join(removed, ", ")),
+		DurationMS:   time.Since(startTime).Milliseconds(),
+	}
 }

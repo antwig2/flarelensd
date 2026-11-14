@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.5"
+	Version = "0.2.6"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -464,7 +464,25 @@ func main() {
 	// 7. Initialize in-memory Feature Flags Store
 	flagStore := flags.NewStore(logger)
 
-	// 8. Initialize WireGuard Mesh Engine (Embedded Overlay Network)
+	// 8. Initialize WireGuard Mesh Engine & Multi-Node Service Router
+	serviceRouter := mesh.NewServiceRouter(
+		cfg.Identity.NodeID,
+		func(rCtx context.Context, ep mesh.ClusterEndpoint) (string, error) {
+			return deployOrchestrator.ResolveLocalEndpointTarget(
+				rCtx,
+				ep.Env,
+				ep.Service,
+				ep.Mode,
+				ep.ContainerName,
+				ep.ContainerPort,
+				ep.ActivePort,
+			)
+		},
+		logger,
+	)
+	defer serviceRouter.Close()
+	deployOrchestrator.SetMeshRoutingHooks(serviceRouter.ExtraHostsForEnv, serviceRouter.RemoteUpstreamURLs)
+
 	var meshMgr *mesh.Manager
 	if cfg.Mesh.Enabled {
 		meshPrivKey, meshPubKey, err := mesh.LoadOrGenerateKeypair(cfg.Mesh.KeyPath)
@@ -477,12 +495,12 @@ func main() {
 				ListenPort:     cfg.Mesh.Port,
 				KeyPath:        cfg.Mesh.KeyPath,
 				PublicEndpoint: cfg.Mesh.Endpoint,
-				Subnet:         "10.42.0.0/16",
+				Subnet:         "100.64.0.0/10",
 			}
 			meshMgr = mesh.NewManager(meshCfg, meshPrivKey, meshPubKey, nil, logger)
 
 			// Async registration with Cloudflare Worker Mesh Control Plane
-			go func() {
+			go func(mgr *mesh.Manager) {
 				if cfg.ControlPlane.Endpoint == "" {
 					return
 				}
@@ -518,16 +536,16 @@ func main() {
 							"subnet", regResp.Subnet,
 							"peers_count", len(regResp.Peers),
 						)
-						meshCfg.OverlayIP = regResp.Peer.OverlayIP
-						meshMgr = mesh.NewManager(meshCfg, meshPrivKey, meshPubKey, nil, logger)
-						if err := meshMgr.InitInterface(context.Background()); err != nil {
+						mgr.SetOverlayIP(regResp.Peer.OverlayIP)
+						serviceRouter.SetOverlayIP(regResp.Peer.OverlayIP)
+						if err := mgr.InitInterface(context.Background()); err != nil {
 							logger.Warn("WireGuard interface init warning (requires kernel module & CAP_NET_ADMIN)", "error", err)
 						} else {
-							_ = meshMgr.SyncPeers(context.Background(), regResp.Peers)
+							_ = mgr.SyncPeers(context.Background(), regResp.Peers)
 						}
 					}
 				}
-			}()
+			}(meshMgr)
 		}
 	}
 
@@ -581,8 +599,8 @@ func main() {
 		logger.Warn("Node enrollment warning", "error", err)
 	}
 
-	// 6. Configure piggybacked command & feature-flag synchronization on the 15s heartbeat loop
-	configureControlPlaneSync(ctx, reporter, flagStore, backupMgr, deployOrchestrator, agentUpdater, cfg, logger)
+	// 6. Configure piggybacked command, mesh peer, placement & feature-flag synchronization on the 15s heartbeat loop
+	configureControlPlaneSync(ctx, reporter, flagStore, backupMgr, deployOrchestrator, agentUpdater, meshMgr, serviceRouter, cfg, logger)
 
 	// 6a. Launch background telemetry + piggybacked control-plane sync loop (every 15s)
 	go reporter.StartHeartbeatLoop(ctx)
@@ -1085,6 +1103,11 @@ type NodeCommand struct {
 	Force                 bool                    `json:"force"`
 	Units                 []string                `json:"units,omitempty"`
 	Reason                string                  `json:"reason,omitempty"`
+	MeshPort              int                     `json:"mesh_port,omitzero"`
+	DrainSeconds          int                     `json:"drain_seconds,omitzero"`
+	ExtraHosts            []string                `json:"extra_hosts,omitempty"`
+	RemoteUpstreams       []string                `json:"remote_upstreams,omitempty"`
+	ForceRemoveStateful   bool                    `json:"force_remove_stateful,omitzero"`
 }
 
 type CommandsResponse struct {
@@ -1098,6 +1121,8 @@ func configureControlPlaneSync(
 	backupMgr *backup.Manager,
 	orchestrator *deploy.Orchestrator,
 	agentUpdater *updater.Updater,
+	meshMgr *mesh.Manager,
+	serviceRouter *mesh.ServiceRouter,
 	cfg *config.Config,
 	logger *slog.Logger,
 ) {
@@ -1118,6 +1143,42 @@ func configureControlPlaneSync(
 		"node_id", nodeID,
 		"initial_flags_synced", initialFlagsSynced,
 	)
+
+	reporter.SetClusterSyncHandler(func(hbCtx context.Context, overlayIP string, rawPeers json.RawMessage, rawEndpoints json.RawMessage) {
+		if overlayIP != "" {
+			if meshMgr != nil && meshMgr.OverlayIP() == "" {
+				meshMgr.SetOverlayIP(overlayIP)
+			}
+			if serviceRouter != nil {
+				serviceRouter.SetOverlayIP(overlayIP)
+			}
+		}
+		if meshMgr != nil && len(rawPeers) > 0 {
+			var peers []mesh.Peer
+			if err := json.Unmarshal(rawPeers, &peers); err == nil && len(peers) > 0 {
+				if err := meshMgr.SyncPeers(hbCtx, peers); err != nil {
+					logger.Debug("Piggybacked WireGuard peer sync skipped or warning", "error", err)
+				}
+			}
+		}
+		if serviceRouter != nil && len(rawEndpoints) > 0 {
+			var endpoints []mesh.ClusterEndpoint
+			if err := json.Unmarshal(rawEndpoints, &endpoints); err == nil {
+				effectiveIP := overlayIP
+				if effectiveIP == "" && meshMgr != nil {
+					effectiveIP = meshMgr.OverlayIP()
+				}
+				serviceRouter.UpdateEndpoints(effectiveIP, endpoints)
+				if orchestrator != nil {
+					for _, g := range serviceRouter.RouteGroups() {
+						if !g.HasLocalNode && len(g.RemoteURLs) > 0 && len(g.Domains) > 0 {
+							_ = orchestrator.SyncRemoteOnlyRoute(g.Env, g.Service, g.Domains, g.RemoteURLs, g.HealthPath)
+						}
+					}
+				}
+			}
+		}
+	})
 
 	reporter.SetSyncHandler(func(hbCtx context.Context, rawCommands []json.RawMessage, flagsVersion string, piggybacked bool) {
 		if len(rawCommands) > 0 {
@@ -1236,6 +1297,8 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 
 				var deployStatus = "success"
 				var deployMsg = fmt.Sprintf("Deployed %s image %s", c.Service, c.Image)
+				var activeSlot string
+				var activePort int
 
 				// Prefer native Kamal-style container orchestrator (multi-network, companion workers, migrations, Traefik zero-downtime)
 				if orchestrator != nil && os.Getenv("FLARELENS_USE_HOST_SCRIPTS") != "true" {
@@ -1257,6 +1320,7 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						Aliases:           c.Aliases,
 						Volumes:           c.Volumes,
 						Workers:           c.Workers,
+						DrainSeconds:      c.DrainSeconds,
 						Secrets:           c.Secrets,
 						Network:           c.Network,
 						TargetDB:          c.TargetDB,
@@ -1267,10 +1331,15 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						MigrationCmd:      c.MigrationCmd,
 						IsPreview:         c.IsPreview,
 						PRNumber:          c.PRNumber,
+						MeshPort:          c.MeshPort,
+						ExtraHosts:        c.ExtraHosts,
+						RemoteUpstreams:   c.RemoteUpstreams,
 					}
 					resp := orchestrator.Deploy(context.Background(), dReq)
 					deployStatus = resp.Status
 					deployMsg = resp.Message
+					activeSlot = resp.ActiveSlot
+					activePort = resp.ActivePort
 				} else if _, err := os.Stat(deployScript); err == nil {
 					logger.Info("Executing host deploy script", "script", deployScript, "env", envName, "version", versionTag)
 					cmdExec := exec.CommandContext(context.Background(), deployScript, envName, versionTag)
@@ -1295,10 +1364,52 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						cfg.ControlPlane.EnrollToken,
 						map[string]any{
 							"deployment_id": cmp.Or(c.DeploymentID, c.ID),
+							"node_id":       nodeID,
 							"service":       c.Service,
+							"env":           c.Env,
 							"status":        deployStatus,
+							"active_slot":   activeSlot,
+							"active_port":   activePort,
 							"message":       deployMsg,
 							"duration_ms":   time.Since(startTime).Milliseconds(),
+						},
+						logger,
+					)
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+
+		case "decommission_service":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator == nil {
+					ackCommand(cfg, client, c.ID, nodeID, logger)
+					return
+				}
+				logger.Info("Executing service decommission on node...", "service", c.Service, "env", c.Env, "id", c.ID)
+				resp := orchestrator.DecommissionService(context.Background(), deploy.DecommissionRequest{
+					DeploymentID:        cmp.Or(c.DeploymentID, c.ID),
+					Service:             c.Service,
+					Env:                 c.Env,
+					ContainerName:       c.ContainerName,
+					Domains:             c.Domains,
+					HealthPath:          c.HealthPath,
+					RemoteUpstreams:     c.RemoteUpstreams,
+					DrainSeconds:        c.DrainSeconds,
+					ForceRemoveStateful: c.ForceRemoveStateful,
+				})
+				if cfg.ControlPlane.Endpoint != "" {
+					reportHTTPStatus(
+						fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+						cfg.ControlPlane.EnrollToken,
+						map[string]any{
+							"deployment_id": resp.DeploymentID,
+							"node_id":       nodeID,
+							"service":       resp.Service,
+							"env":           c.Env,
+							"status":        resp.Status,
+							"message":       resp.Message,
+							"duration_ms":   resp.DurationMS,
 						},
 						logger,
 					)
@@ -1329,6 +1440,7 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 					Entrypoint:            c.Entrypoint,
 					Healthcheck:           c.Healthcheck,
 					Secrets:               c.Secrets,
+					ExtraHosts:            c.ExtraHosts,
 					ForceRecreateStateful: c.ForceRecreateStateful,
 				})
 				if cfg.ControlPlane.Endpoint != "" {

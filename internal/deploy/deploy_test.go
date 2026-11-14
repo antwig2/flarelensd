@@ -1262,3 +1262,73 @@ func TestTraefikSwitchRouteWithMultiDomainsAndRuleAugmentation(t *testing.T) {
 		t.Fatalf("expected both preserved HostRegexp and appended Host(`portal.example.com`), got:\n%s", augStr)
 	}
 }
+
+func TestMultiNodeTraefikMeshUpstreamsAndDecommissionFencing(t *testing.T) {
+	routesDir := t.TempDir()
+	flipper := NewTraefikRouteFlipper(routesDir)
+
+	if err := flipper.SyncMultiNodeRoute(
+		"prod",
+		"checkout-api",
+		[]string{"api.example.com"},
+		[]string{"http://127.0.0.1:18081", "http://100.64.0.2:28080", "http://100.64.0.3:28080"},
+		"/health",
+	); err != nil {
+		t.Fatalf("SyncMultiNodeRoute failed: %v", err)
+	}
+
+	routeFile := filepath.Join(routesDir, "prod-checkout-api.yaml")
+	rawBytes, err := os.ReadFile(routeFile)
+	if err != nil {
+		t.Fatalf("read multi-node route: %v", err)
+	}
+	content := string(rawBytes)
+	for _, want := range []string{
+		`path: "/health"`,
+		`url: "http://127.0.0.1:18081"`,
+		`url: "http://100.64.0.2:28080"`,
+		`url: "http://100.64.0.3:28080"`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in multi-node Traefik YAML, got:\n%s", want, content)
+		}
+	}
+
+	// Verify DecommissionService fences stateful Postgres singletons by default,
+	// while draining stateless services and repointing Traefik to surviving remote mesh replicas.
+	orch := NewOrchestrator(NewDockerRunner("mock://docker.sock"), NewHealthProber(), flipper, nil, "node-1", nil)
+	fenced := orch.DecommissionService(t.Context(), DecommissionRequest{
+		DeploymentID:  "dec-pg-1",
+		Service:       "postgres",
+		Env:           "prod",
+		ContainerName: "postgres-prod",
+	})
+	if fenced.Status != "skipped" {
+		t.Fatalf("expected stateful postgres decommission to be fenced (skipped), got %s: %s", fenced.Status, fenced.Message)
+	}
+
+	decStateless := orch.DecommissionService(t.Context(), DecommissionRequest{
+		DeploymentID:    "dec-api-1",
+		Service:         "checkout-api",
+		Env:             "prod",
+		Domains:         []string{"api.example.com"},
+		HealthPath:      "/health",
+		RemoteUpstreams: []string{"http://100.64.0.2:28080", "http://100.64.0.3:28080"},
+		DrainSeconds:    0,
+	})
+	if decStateless.Status != "success" {
+		t.Fatalf("expected stateless decommission success, got %s: %s", decStateless.Status, decStateless.Message)
+	}
+
+	afterDrainBytes, err := os.ReadFile(routeFile)
+	if err != nil {
+		t.Fatalf("expected Traefik route to remain pointed at surviving remote mesh replicas: %v", err)
+	}
+	afterDrain := string(afterDrainBytes)
+	if strings.Contains(afterDrain, "127.0.0.1:18081") {
+		t.Fatalf("expected drained local replica 127.0.0.1:18081 removed from Traefik route, got:\n%s", afterDrain)
+	}
+	if !strings.Contains(afterDrain, "http://100.64.0.2:28080") {
+		t.Fatalf("expected surviving mesh replica http://100.64.0.2:28080 retained in Traefik route, got:\n%s", afterDrain)
+	}
+}

@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -340,11 +341,79 @@ func (t *TraefikRouteFlipper) SetCanaryRouteWithDomains(service string, domains 
 	return nil
 }
 
+// SyncMultiNodeRoute writes a multi-replica Traefik load-balancer route spanning local and remote WireGuard mesh upstreams.
+func (t *TraefikRouteFlipper) SyncMultiNodeRoute(stack, service string, domains []string, upstreamURLs []string, healthPath string) error {
+	cleanDomains := dedupeNonEmptyStrings(domains)
+	cleanUpstreams := dedupeNonEmptyStrings(upstreamURLs)
+	rule := FormatHostRule(cleanDomains...)
+	if rule == "" || len(cleanUpstreams) == 0 {
+		return fmt.Errorf("cannot sync multi-node Traefik route for %s-%s: domains or upstreams empty", stack, service)
+	}
+	if err := os.MkdirAll(t.dynamicDir, 0755); err != nil {
+		return fmt.Errorf("failed to create traefik dynamic config directory: %w", err)
+	}
+
+	routeKey := service
+	if stack != "" {
+		routeKey = fmt.Sprintf("%s-%s", stack, service)
+	}
+	entryPoint := t.detectDefaultEntryPoint()
+	probePath := cmp.Or(strings.TrimSpace(healthPath), "/health")
+	if !strings.HasPrefix(probePath, "/") {
+		probePath = "/" + probePath
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, `http:
+  routers:
+    %s-router:
+      rule: %q
+      service: "%s-svc"
+      entryPoints:
+        - %q
+  services:
+    %s-svc:
+      loadBalancer:
+`, routeKey, rule, routeKey, entryPoint, routeKey)
+
+	if len(cleanUpstreams) > 1 {
+		fmt.Fprintf(&b, `        healthCheck:
+          path: %q
+          interval: "10s"
+          timeout: "3s"
+`, probePath)
+	}
+
+	b.WriteString("        servers:\n")
+	for _, u := range cleanUpstreams {
+		fmt.Fprintf(&b, "          - url: %q\n", u)
+	}
+
+	finalPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", routeKey))
+	tmpPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml.tmp", routeKey))
+	if err := os.WriteFile(tmpPath, []byte(b.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write temporary multi-node traefik route file: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to atomically rename multi-node traefik route: %w", err)
+	}
+
+	// Remove any legacy duplicate single-name route file if stack-prefixed route was written
+	if routeKey != service {
+		_ = os.Remove(filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", service)))
+		_ = os.Remove(filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yml", service)))
+	}
+	return nil
+}
+
 // RemoveRoute removes the dynamic Traefik route file for an ephemeral preview or retired service
 func (t *TraefikRouteFlipper) RemoveRoute(service string) error {
-	path := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", service))
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove traefik route file: %w", err)
+	for _, ext := range []string{"yaml", "yml"} {
+		path := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.%s", service, ext))
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove traefik route file: %w", err)
+		}
 	}
 	return nil
 }

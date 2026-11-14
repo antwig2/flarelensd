@@ -30,6 +30,19 @@ func (m *MigrationRunner) Run(
 	network string,
 	binds ...string,
 ) (string, error) {
+	return m.RunWithExtraHosts(ctx, image, command, envVars, network, nil, binds...)
+}
+
+// RunWithExtraHosts executes a database migration command with cross-node WireGuard ExtraHosts (--add-host) injected.
+func (m *MigrationRunner) RunWithExtraHosts(
+	ctx context.Context,
+	image string,
+	command string,
+	envVars []string,
+	network string,
+	extraHosts []string,
+	binds ...string,
+) (string, error) {
 	if command == "" {
 		command = "migrate up"
 	}
@@ -37,6 +50,12 @@ func (m *MigrationRunner) Run(
 	cmdArgs := []string{"run", "--rm"}
 	if network != "" {
 		cmdArgs = append(cmdArgs, "--network", network)
+	}
+
+	for _, hostMap := range extraHosts {
+		if trimmed := strings.TrimSpace(hostMap); trimmed != "" {
+			cmdArgs = append(cmdArgs, "--add-host", trimmed)
+		}
 	}
 
 	for _, b := range binds {

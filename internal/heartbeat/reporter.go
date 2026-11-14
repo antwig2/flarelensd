@@ -43,27 +43,34 @@ type NodeTelemetryHeartbeat struct {
 
 // SyncResponse represents the piggybacked control-plane payload returned by POST /api/v1/ingest.
 type SyncResponse struct {
-	Status       string            `json:"status"`
-	Count        int               `json:"count"`
-	Commands     []json.RawMessage `json:"commands"`
-	FlagsVersion *string           `json:"flags_version"`
+	Status           string            `json:"status"`
+	Count            int               `json:"count"`
+	Commands         []json.RawMessage `json:"commands"`
+	FlagsVersion     *string           `json:"flags_version"`
+	OverlayIP        string            `json:"overlay_ip,omitempty"`
+	MeshPeers        json.RawMessage   `json:"mesh_peers,omitempty"`
+	ClusterEndpoints json.RawMessage   `json:"cluster_endpoints,omitempty"`
 }
 
 // SyncHandler processes piggybacked commands and feature-flag version markers returned on each HTTP heartbeat.
 // piggybacked is true when the control plane includes flags_version in its ingest response.
 type SyncHandler func(ctx context.Context, commands []json.RawMessage, flagsVersion string, piggybacked bool)
 
+// ClusterSyncHandler processes piggybacked WireGuard mesh peers and multi-node service placement endpoints.
+type ClusterSyncHandler func(ctx context.Context, overlayIP string, meshPeers json.RawMessage, clusterEndpoints json.RawMessage)
+
 // Reporter coordinates periodic heartbeats and initial node enrollment
 type Reporter struct {
-	cfg        *config.Config
-	sampler    *system.Sampler
-	inspector  *docker.Inspector
-	natsClient *transport.NATSClient
-	httpClient *http.Client
-	logger     *slog.Logger
-	version    string
-	syncMu     sync.RWMutex
-	onSync     SyncHandler
+	cfg            *config.Config
+	sampler        *system.Sampler
+	inspector      *docker.Inspector
+	natsClient     *transport.NATSClient
+	httpClient     *http.Client
+	logger         *slog.Logger
+	version        string
+	syncMu         sync.RWMutex
+	onSync         SyncHandler
+	onClusterSync  ClusterSyncHandler
 }
 
 // SetSyncHandler registers a callback invoked with piggybacked commands and flags_version after each HTTP heartbeat.
@@ -71,6 +78,13 @@ func (r *Reporter) SetSyncHandler(fn SyncHandler) {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	r.onSync = fn
+}
+
+// SetClusterSyncHandler registers a callback invoked with piggybacked WireGuard mesh peers and cluster service placements.
+func (r *Reporter) SetClusterSyncHandler(fn ClusterSyncHandler) {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	r.onClusterSync = fn
 }
 
 // NewReporter creates a new telemetry reporter
@@ -281,8 +295,9 @@ func (r *Reporter) sendHTTPTelemetry(ctx context.Context, payload NodeTelemetryH
 
 	r.syncMu.RLock()
 	handler := r.onSync
+	clusterHandler := r.onClusterSync
 	r.syncMu.RUnlock()
-	if handler == nil {
+	if handler == nil && clusterHandler == nil {
 		return
 	}
 
@@ -296,10 +311,16 @@ func (r *Reporter) sendHTTPTelemetry(ctx context.Context, payload NodeTelemetryH
 		return
 	}
 
-	flagsVersion := ""
-	piggybacked := syncResp.FlagsVersion != nil
-	if piggybacked {
-		flagsVersion = *syncResp.FlagsVersion
+	if clusterHandler != nil && (len(syncResp.MeshPeers) > 0 || len(syncResp.ClusterEndpoints) > 0 || syncResp.OverlayIP != "") {
+		clusterHandler(ctx, syncResp.OverlayIP, syncResp.MeshPeers, syncResp.ClusterEndpoints)
 	}
-	handler(ctx, syncResp.Commands, flagsVersion, piggybacked)
+
+	if handler != nil {
+		flagsVersion := ""
+		piggybacked := syncResp.FlagsVersion != nil
+		if piggybacked {
+			flagsVersion = *syncResp.FlagsVersion
+		}
+		handler(ctx, syncResp.Commands, flagsVersion, piggybacked)
+	}
 }

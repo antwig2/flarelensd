@@ -44,11 +44,12 @@ It unifies 4 major systems that previously required 4 separate tools:
 #### 2. Zero-Trust Networking (Replaces Bastion Hosts / Tailscale / OpenVPN)
 - **Serverless Edge Coordinator**: Coordinated serverlessly across 330+ Cloudflare edge PoPs (Workers + KV) with RFC 8628 Device Flow browser SSO (`@yourcompany.com`). **Zero coordinator VMs or SQLite databases to maintain.**
 - **Pure P2P WireGuard Data Plane**: Encrypted point-to-point overlay (`100.64.0.0/10` CGNAT) running directly over UDP with **< 0.1ms kernel latency and $0 egress fees**.
-- **Traefik Mesh Ingress**: Internal dashboards and container services bind directly to `100.64.0.1` (`flarelens0`), leaving zero public firewall ports open to port scanners.
+- **Traefik Mesh Ingress & Multi-Node Service Router**: Internal dashboards and container services bind directly to `100.64.0.x:<mesh_port>` (`flarelens0`), leaving zero public firewall ports open while forwarding cross-node service traffic (`ExtraHosts` + round-robin WireGuard TCP listeners) across cluster peers.
 - **Outbound-Only Signaling**: Eliminates open inbound SSH ports (port 22) to the public internet; port 22 is strictly bound to the private WireGuard mesh.
 
 #### 3. GitOps & Zero-Downtime Deployments (Replaces Portainer / Jenkins / ArgoCD)
-- **Atomic Blue/Green Rollouts**: Deploys the new container (Green), verifies its health on localhost, and performs an atomic inotify swap on Traefik routing in **< 1 millisecond** (zero dropped TCP connections).
+- **Atomic Blue/Green Rollouts & Multi-Replica Traefik LB**: Deploys the new container (Green), verifies its health on localhost, merges remote WireGuard replica upstreams with health checks, and performs an atomic inotify swap on Traefik routing in **< 1 millisecond** (zero dropped TCP connections).
+- **Safe Node Drain & Stateful Volume Fencing**: Executes `decommission_service` during node cordoning/draining while refusing to wipe stateful database containers unless explicitly forced.
 - **Isolated Migration Runner**: Executes database schema migrations in an ephemeral container with auto-rollback before live traffic hits the new app version.
 
 #### 4. Secrets Vault & Feature Flags (Replaces HashiCorp Vault / LaunchDarkly)

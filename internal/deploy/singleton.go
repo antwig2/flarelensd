@@ -38,6 +38,7 @@ type SingletonSpec struct {
 	Entrypoint            []string          `json:"entrypoint,omitempty"`
 	Healthcheck           *HealthcheckSpec  `json:"healthcheck,omitempty"`
 	Secrets               map[string]string `json:"secrets,omitempty"`
+	ExtraHosts            []string          `json:"extra_hosts,omitempty"`
 	ForceRecreateStateful bool              `json:"force_recreate_stateful,omitempty"`
 }
 
@@ -211,6 +212,8 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		labels["flarelens.aliases"] = strings.Join(aliases, ",")
 	}
 
+	mergedExtraHosts := dedupeNonEmptyStrings(append(slices.Clone(spec.ExtraHosts), o.extraHostsForEnv(envName)...))
+
 	containerID, err := o.runner.CreateContainerWithOptions(ctx, ContainerConfig{
 		Name:          containerName,
 		Image:         spec.Image,
@@ -218,6 +221,7 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		Cmd:           spec.Command,
 		Entrypoint:    spec.Entrypoint,
 		Binds:         dedupeNonEmptyStrings(spec.Volumes),
+		ExtraHosts:    mergedExtraHosts,
 		PortMappings:  spec.Ports,
 		RestartPolicy: cmp.Or(strings.TrimSpace(spec.Restart), "always"),
 		Healthcheck:   toContainerHealthcheck(spec.Healthcheck),

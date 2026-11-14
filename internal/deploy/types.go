@@ -42,6 +42,22 @@ type DeployRequest struct {
 	CanaryDuration    int               `json:"canary_duration"`
 	IsPreview         bool              `json:"is_preview"`
 	PRNumber          int               `json:"pr_number"`
+	MeshPort          int               `json:"mesh_port,omitzero"`
+	ExtraHosts        []string          `json:"extra_hosts,omitempty"`
+	RemoteUpstreams   []string          `json:"remote_upstreams,omitempty"`
+}
+
+// DecommissionRequest drains and removes stateless service replicas evicted from a node during scale-down or Node Drain.
+type DecommissionRequest struct {
+	DeploymentID        string   `json:"deployment_id,omitempty"`
+	Service             string   `json:"service"`
+	Env                 string   `json:"env,omitempty"`
+	ContainerName       string   `json:"container_name,omitempty"`
+	Domains             []string `json:"domains,omitempty"`
+	HealthPath          string   `json:"health_path,omitempty"`
+	RemoteUpstreams     []string `json:"remote_upstreams,omitempty"`
+	DrainSeconds        int      `json:"drain_seconds,omitzero"`
+	ForceRemoveStateful bool     `json:"force_remove_stateful,omitzero"`
 }
 
 // TeardownRequest defines parameters to tear down an ephemeral PR preview container and route
