@@ -482,10 +482,12 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		}
 	}
 
+	effectiveDomains := dedupeNonEmptyStrings(append([]string{req.Domain}, req.Domains...))
+
 	// 9. Optional Canary Soak Phase
-	if req.CanaryWeight > 0 && req.CanaryWeight < 100 && req.Domain != "" {
+	if req.CanaryWeight > 0 && req.CanaryWeight < 100 && len(effectiveDomains) > 0 {
 		o.emitProgress(req, "canary", fmt.Sprintf("Candidate healthy! Starting canary soak: %d%% candidate, %d%% live", req.CanaryWeight, 100-req.CanaryWeight), 75)
-		if err := o.traefik.SetCanaryRoute(baseServiceName, req.Domain, currentPort, candidatePort, req.CanaryWeight); err != nil {
+		if err := o.traefik.SetCanaryRouteWithDomains(baseServiceName, effectiveDomains, currentPort, candidatePort, req.CanaryWeight); err != nil {
 			o.logger.Error("Failed to configure canary route", "error", err)
 			_ = o.runner.StopContainer(ctx, containerID, 2)
 			_ = o.runner.RemoveContainer(ctx, containerID)
@@ -495,14 +497,14 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		soakDuration := time.Duration(cmp.Or(req.CanaryDuration, 5)) * time.Second
 		select {
 		case <-ctx.Done():
-			_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain, profile.Aliases...)
+			_ = o.traefik.SwitchRouteWithDomains(envName, baseServiceName, prevName, profile.ContainerPort, effectiveDomains, profile.Aliases...)
 			_ = o.runner.StopContainer(ctx, containerID, 2)
 			_ = o.runner.RemoveContainer(ctx, containerID)
 			return o.failResponse(req, "Deployment cancelled during canary soak", currentSlot, startTime)
 		case <-time.After(soakDuration):
 			if err := o.prober.Probe(ctx, probeURL, 5*time.Second, 500*time.Millisecond); err != nil {
 				o.logger.Warn("Candidate failed during canary soak! Rolling back to 100% live", "error", err)
-				_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain, profile.Aliases...)
+				_ = o.traefik.SwitchRouteWithDomains(envName, baseServiceName, prevName, profile.ContainerPort, effectiveDomains, profile.Aliases...)
 				_ = o.runner.StopContainer(ctx, containerID, 2)
 				_ = o.runner.RemoveContainer(ctx, containerID)
 				return DeployResponse{
@@ -537,10 +539,10 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 
 	// Zero-Downtime Traffic Switch in Traefik
 	o.emitProgress(req, "flipping", fmt.Sprintf("Candidate healthy! Atomically flipping live route to %s (%s)", candidateName, candidateSlot), 88)
-	if err := o.traefik.SwitchRoute(envName, baseServiceName, candidateName, profile.ContainerPort, req.Domain, profile.Aliases...); err != nil {
+	if err := o.traefik.SwitchRouteWithDomains(envName, baseServiceName, candidateName, profile.ContainerPort, effectiveDomains, profile.Aliases...); err != nil {
 		o.logger.Warn("Traefik SwitchRoute warning, trying FlipRoute fallback", "error", err)
-		if req.Domain != "" {
-			_ = o.traefik.FlipRoute(candidateName, req.Domain, candidatePort)
+		if len(effectiveDomains) > 0 {
+			_ = o.traefik.FlipRouteWithDomains(candidateName, effectiveDomains, candidatePort)
 		}
 	}
 

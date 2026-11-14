@@ -16,9 +16,10 @@ type DeployRequest struct {
 	DeploymentID      string            `json:"deployment_id"`
 	Service           string            `json:"service"`         // e.g. "api-server"
 	Image             string            `json:"image"`           // e.g. "ghcr.io/org/api-server:v1.0"
-	Env               string            `json:"env"`             // "prod", "staging", "uat"
-	Domain            string            `json:"domain"`          // e.g. "api.example.com"
-	ContainerPort     int               `json:"container_port"`  // internal port, e.g. 8081
+	Env               string            `json:"env"`              // "prod", "staging", "uat"
+	Domain            string            `json:"domain"`           // e.g. "api.example.com"
+	Domains           []string          `json:"domains,omitempty"` // optional multi-host routing rules, e.g. ["api.example.com", "auth.example.com"]
+	ContainerPort     int               `json:"container_port"`   // internal port, e.g. 8081
 	HostPortBlue      int               `json:"host_port_blue"`  // host port for blue slot
 	HostPortGreen     int               `json:"host_port_green"` // host port for green slot
 	HealthPath        string            `json:"health_path"`     // e.g. "/health"

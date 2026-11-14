@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.4"
+	Version = "0.2.5"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -1062,6 +1062,7 @@ type NodeCommand struct {
 	HostPortBlue          int                     `json:"host_port_blue"`
 	HostPortGreen         int                     `json:"host_port_green"`
 	Domain                string                  `json:"domain"`
+	Domains               []string                `json:"domains,omitempty"`
 	HealthPath            string                  `json:"health_path"`
 	Secrets               map[string]string       `json:"secrets"`
 	Network               string                  `json:"network"`
@@ -1082,6 +1083,8 @@ type NodeCommand struct {
 	SHA256                string                  `json:"sha256"`
 	DownloadURL           string                  `json:"download_url"`
 	Force                 bool                    `json:"force"`
+	Units                 []string                `json:"units,omitempty"`
+	Reason                string                  `json:"reason,omitempty"`
 }
 
 type CommandsResponse struct {
@@ -1207,8 +1210,10 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 			continue // Already in-flight
 		}
 
-		// Acknowledge immediately so worker removes it from R2 / memory queue
-		ackCommand(cfg, client, cmd.ID, nodeID, logger)
+		// Acknowledge immediately for non-reboot commands; reboot_node strictly verifies ACK before invoking reboot
+		if cmd.Type != "reboot_node" {
+			ackCommand(cfg, client, cmd.ID, nodeID, logger)
+		}
 
 		logger.Info("Received queued command from FlareLens Control Plane", "id", cmd.ID, "type", cmd.Type, "tag", cmd.Tag)
 		switch cmd.Type {
@@ -1241,6 +1246,7 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						Image:             c.Image,
 						Env:               c.Env,
 						Domain:            c.Domain,
+						Domains:           c.Domains,
 						ContainerPort:     c.ContainerPort,
 						HostPortBlue:      c.HostPortBlue,
 						HostPortGreen:     c.HostPortGreen,
@@ -1437,10 +1443,162 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 				)
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
+
+		case "retire_systemd_units":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				startTime := time.Now()
+				logger.Info("Executing zero-SSH systemd unit retirement...", "units", c.Units, "id", c.ID)
+
+				results, err := system.RetireSystemdUnits(context.Background(), c.Units, nil)
+				retiredCount := 0
+				missingCount := 0
+				retiredNames := make([]string, 0, len(results))
+				for _, r := range results {
+					switch r.Status {
+					case "retired":
+						retiredCount++
+						retiredNames = append(retiredNames, r.Unit)
+					case "not_present":
+						missingCount++
+					}
+				}
+
+				status := "success"
+				msg := fmt.Sprintf("Systemd maintenance complete: %d retired (%s), %d not present", retiredCount, strings.Join(retiredNames, ", "), missingCount)
+				if err != nil {
+					status = "failed"
+					msg = fmt.Sprintf("Systemd maintenance error: %v (retired=%d, not_present=%d)", err, retiredCount, missingCount)
+					logger.Error("Systemd unit retirement failed", "error", err, "id", c.ID)
+				} else {
+					logger.Info("Systemd unit retirement succeeded", "retired", retiredCount, "not_present", missingCount, "id", c.ID)
+				}
+
+				if cfg.ControlPlane.Endpoint != "" {
+					reportHTTPStatusSync(
+						fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+						cfg.ControlPlane.EnrollToken,
+						map[string]any{
+							"deployment_id": cmp.Or(c.DeploymentID, c.ID),
+							"service":       cmp.Or(c.Service, "host-maintenance"),
+							"status":        status,
+							"message":       msg,
+							"duration_ms":   time.Since(startTime).Milliseconds(),
+						},
+						logger,
+					)
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+
+		case "reboot_node":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				startTime := time.Now()
+				logger.Warn("Received drain-locked graceful OS reboot command", "id", c.ID, "reason", c.Reason)
+
+				isIdle := func() bool {
+					return (orchestrator == nil || orchestrator.ActiveOps() == 0) && activeBackupOps.Load() == 0
+				}
+				if err := system.WaitForDrainLock(context.Background(), isIdle, 5*time.Minute, 500*time.Millisecond); err != nil {
+					logger.Error("Aborting OS reboot: active operations did not drain within timeout", "error", err, "id", c.ID)
+					if cfg.ControlPlane.Endpoint != "" {
+						reportHTTPStatusSync(
+							fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+							cfg.ControlPlane.EnrollToken,
+							map[string]any{
+								"deployment_id": cmp.Or(c.DeploymentID, c.ID),
+								"service":       cmp.Or(c.Service, "host-reboot"),
+								"status":        "failed",
+								"message":       fmt.Sprintf("Aborted reboot: %v", err),
+								"duration_ms":   time.Since(startTime).Milliseconds(),
+							},
+							logger,
+						)
+					}
+					ackCommand(cfg, client, c.ID, nodeID, logger)
+					return
+				}
+
+				// CRITICAL: Confirm command ACK on the control plane BEFORE calling reboot so the node can never reboot-loop
+				if err := ackCommandStrict(context.Background(), cfg, client, c.ID, nodeID, logger); err != nil {
+					logger.Error("Aborting OS reboot: failed to confirm command ACK with control plane", "error", err, "id", c.ID)
+					if cfg.ControlPlane.Endpoint != "" {
+						reportHTTPStatusSync(
+							fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+							cfg.ControlPlane.EnrollToken,
+							map[string]any{
+								"deployment_id": cmp.Or(c.DeploymentID, c.ID),
+								"service":       cmp.Or(c.Service, "host-reboot"),
+								"status":        "failed",
+								"message":       fmt.Sprintf("Aborted reboot to prevent loop: command ACK failed (%v)", err),
+								"duration_ms":   time.Since(startTime).Milliseconds(),
+							},
+							logger,
+						)
+					}
+					return
+				}
+
+				if cfg.ControlPlane.Endpoint != "" {
+					reportHTTPStatusSync(
+						fmt.Sprintf("%s/api/v1/control/deploy/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/")),
+						cfg.ControlPlane.EnrollToken,
+						map[string]any{
+							"deployment_id": cmp.Or(c.DeploymentID, c.ID),
+							"service":       cmp.Or(c.Service, "host-reboot"),
+							"status":        "success",
+							"message":       fmt.Sprintf("Graceful OS reboot initiated on %s after drain lock and verified command ACK", nodeID),
+							"duration_ms":   time.Since(startTime).Milliseconds(),
+						},
+						logger,
+					)
+				}
+
+				logger.Warn("Drain lock clear and command ACK verified; executing system reboot in 2s...", "node_id", nodeID, "id", c.ID)
+				time.Sleep(2 * time.Second)
+				executeSystemReboot(logger)
+			}(cmd)
+
 		default:
 			inFlightCommands.Delete(cmd.ID)
 		}
 	}
+}
+
+func ackCommandStrict(ctx context.Context, cfg *config.Config, client *http.Client, cmdID string, nodeID string, logger *slog.Logger) error {
+	if cfg.ControlPlane.Endpoint == "" {
+		return errors.New("control plane endpoint is empty")
+	}
+	ackURL := fmt.Sprintf("%s/api/v1/control/commands/ack?id=%s&node_id=%s",
+		strings.TrimRight(cfg.ControlPlane.Endpoint, "/"),
+		url.QueryEscape(cmdID),
+		url.QueryEscape(nodeID),
+	)
+	var lastErr error
+	for attempt := range 3 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ackURL, nil)
+		if err != nil {
+			return err
+		}
+		if cfg.ControlPlane.EnrollToken != "" {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", cfg.ControlPlane.EnrollToken))
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			lastErr = fmt.Errorf("unexpected ACK status %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		logger.Warn("Retrying strict command ACK...", "attempt", attempt+1, "id", cmdID, "error", lastErr)
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	return lastErr
 }
 
 func ackCommand(cfg *config.Config, client *http.Client, cmdID string, nodeID string, logger *slog.Logger) {

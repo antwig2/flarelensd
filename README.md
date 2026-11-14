@@ -226,11 +226,17 @@ A foundational design principle of FlareLens is the strict physical separation b
 ### Why Cloudflare for the Control Plane?
 Traditional platforms require provisioning and maintaining expensive central master servers (Kubernetes Control Plane nodes, HashiCorp Consul clusters, or Jenkins controllers) with open public IP ports. 
 
-FlareLens eliminates the master server by leveraging Cloudflare's serverless edge primitives:
+FlareLens eliminates the master server by leveraging Cloudflare's free-tier serverless edge primitives:
 - **Cloudflare Workers**: High-performance, sub-10ms global edge API.
-- **Cloudflare Access**: Enterprise Zero-Trust identity (Google, GitHub, Microsoft 365, or Email One-Time PIN) protecting the dashboard without opening public firewall ports.
-- **Cloudflare KV**: Ephemeral signaling and peer coordination registry.
-- **Cloudflare R2**: Columnar Parquet log lakehouse and database backup storage with **zero bandwidth egress fees**.
+- **Cloudflare D1 (`$0` Free Tier)**: Relational control-plane state (`nodes`, `node_commands`, `deployments`, `feature_flags`) piggybacked onto a single **15-second heartbeat** (`POST /api/v1/ingest`) — **zero R2 `list()` Class A polling calls**.
+- **Cloudflare Access**: Optional Enterprise Zero-Trust identity (Google, GitHub, Microsoft 365, or Email One-Time PIN) protecting the dashboard.
+- **Cloudflare KV**: AES-256-GCM encrypted Secrets Vault, declarative `fleet/*.yml` manifest registry, and WireGuard peer coordination.
+- **Cloudflare R2**: Columnar Parquet log lakehouse and streaming database backup storage with **zero bandwidth egress fees**.
+
+### Public Ingress: Standalone Traefik/Caddy vs. Optional `cloudflared`
+**Standalone FlareLens users do NOT need `cloudflared`.**
+- **Direct Edge Ingress (Default)**: Point DNS `A`/`AAAA` records directly at your VM (`80/tcp`, `443/tcp`) and let Traefik or Caddy terminate Let's Encrypt TLS natively while `flarelensd` flips dynamic upstream routes in `< 1ms`.
+- **Optional Zero-Inbound-Port Tunnel (`cloudflared`)**: If you want zero open inbound TCP ports (`22`, `80`, `443` all closed at your cloud firewall) plus Cloudflare WAF/DDoS protection, you can optionally declare `cloudflared` as a singleton container in `fleet/infra/cloudflared.yml` (`networks: ["host"]`, `adopt_only: true`) forwarding to `http://127.0.0.1:80` (Traefik).
 
 ### Why WireGuard for the Data Plane?
 Private inter-server communications, database replication, internal microservice calls, and operator SSH sessions **never touch Cloudflare**. They travel **directly peer-to-peer (P2P)** between your machines over an encrypted WireGuard UDP overlay (`10.42.0.0/16`), delivering full line-speed and absolute privacy.
@@ -240,75 +246,83 @@ Private inter-server communications, database replication, internal microservice
 ## ✨ Core Superpowers
 
 ### 🌐 1. Serverless Edge-Native WireGuard Mesh (P2P)
-- **Serverless Cloudflare Edge Coordinator**: Replaces centralized Headscale VMs with a global serverless coordinator on Cloudflare Workers + KV (`control.yourcompany.com`). Zero coordinator VMs and zero SQLite databases to manage.
+- **Serverless Cloudflare Edge Coordinator**: Replaces centralized Headscale VMs with a global serverless coordinator on Cloudflare Workers + KV (`control.yourcompany.com`). Zero coordinator VMs and zero SQLite servers to manage.
 - **Browser SSO Device Flow (RFC 8628)**: Users run `sudo flarelens-agent login` and authenticate via Cloudflare Access Zero Trust (`@yourcompany.com`) in their web browser.
 - **Pure P2P Kernel Data Plane**: Traffic between servers and laptops flows directly peer-to-peer at line-rate Linux kernel speed (`flarelens0` via ChaCha20-Poly1305) with zero proxy hops.
-- **Traefik Mesh Integration**: Workloads and admin dashboards listen exclusively on `100.64.0.1`, keeping public firewall ports completely closed to attackers.
+- **Traefik Mesh Integration**: Workloads and admin dashboards can listen exclusively on private/loopback interfaces, keeping public firewall ports closed to attackers.
 - **Pure Go Cryptography**: Keypairs generated in-memory using `golang.org/x/crypto/curve25519` with RFC 7748 key clamping (`priv[0] &= 248`, `priv[31] = (priv[31] & 127) | 64`).
-- **Zero Inbound WAN Ports**: Traverses NATs and corporate firewalls without opening host SSH ports (port 22) to the public internet; administrative SSH is locked strictly to the private mesh.
+- **Zero Inbound WAN SSH**: Traverses NATs and corporate firewalls without opening host SSH ports (port 22) to the public internet; administrative SSH is locked strictly to the private mesh.
 
-### 🔄 2. Blue/Green Zero-Downtime GitOps
-- **Atomic Inotify Route Swapping**: Traefik routing rules are updated via atomic file renames (`os.Rename(tmp, final)` to `/etc/traefik/dynamic/service.yaml`). This prevents `inotify` from reading incomplete YAML during rollouts, cutting over traffic in **< 1 millisecond with zero dropped TCP packets**.
-- **Canary & Health Probing**: Automatically runs HTTP readiness checks on candidate containers before traffic cutover.
-- **Isolated Migration Runner**: Executes database migrations inside an ephemeral container (`docker run --rm`) on a private network with injected secrets.
-- **Automated Rollback**: If candidate probes fail or migrations abort, the active container continues serving traffic with **zero downtime**.
+### 🔄 2. Declarative `fleet/*.yml` & Blue/Green Zero-Downtime GitOps
+- **ArgoCD-Style `fleet/<env>/*.yml` Reconciliation**: Syncs both stateless Blue/Green web services (with Kamal-style companion `workers`, `aliases`, `domains`, and `env_vars`) and stateful/infrastructure singletons (`postgres`, `dragonfly`, `traefik`, `vector`, optional `cloudflared`) with `adopt_only: true`, `networks: ["host"]`, and `enabled: false` (`Suspended` staging).
+- **Atomic Inotify Route Swapping**: Auto-discovers Traefik's live dynamic routes mount (including nested `routes/` subdirectories), updates existing alias route files in place or generates multi-host `Host(...) || Host(...)` rules via atomic file renames (`os.Rename(tmp, final)`), cutting over traffic in **< 1 millisecond with zero dropped TCP packets**.
+- **Brownfield Slot & Port Adoption**: Automatically detects pre-existing legacy slot containers, avoids bound host-port collisions, promotes stable Docker DNS aliases (`PromoteNetworkAliases`) after readiness probes pass, and cleanly retires replaced web/worker containers after drain.
+- **Isolated Migration Runner & Automated Rollback**: Executes database migrations inside an ephemeral container (`docker run --rm`) with RAM-mounted secret files before cutover, rolling back automatically on failure.
 
-### 🚩 3. Edge-Synchronized Feature Flags
+### 🔁 3. Zero-SSH Over-The-Air (OTA) Upgrades & Host Maintenance
+- **Cryptographic `self_update`**: Verified with SHA-256 digests, drain-locked (`ActiveOps() == 0`), symlink-safe under `ProtectSystem=full`, smoke-tested before atomic swap, and self-healing if restart fails.
+- **Allowlisted Systemd Unit Retirement (`retire_systemd_units`)**: Safely stops and disables deprecated host polling `.timer`/`.service` units over D-Bus without SSH or shell invocation while blocking protected OS/agent units.
+- **Drain-Locked Graceful OS Reboot (`reboot_node`)**: Waits for active deployments and R2 backups to drain, strictly confirms command `ACK` with the D1 control plane first (making reboot loops impossible), and triggers a clean `systemctl reboot` when `/var/run/reboot-required` is raised.
+
+### 🚩 4. Edge-Synchronized Feature Flags
 - **Zero-Latency In-Memory Evaluation**: The Go agent maintains a local, thread-safe cache (`Store` with `sync.RWMutex`). Application flag lookups complete in **< 1 microsecond with 0 network hops**.
-- **Real-Time Edge Sync**: Toggling a flag on the dashboard propagates updates via Cloudflare Edge KV & fast outbound polling/SSE streams.
+- **Piggybacked Edge Sync**: Flag version hashes travel inside the 15-second heartbeat response, triggering instant delta syncs only when flags actually change.
 - **Percentage Rollouts**: Supports deterministic rollout percentages (`rollout_pct: 0-100`) and environment scoping (`production`, `staging`, `infra`).
 
-### 📊 4. Parquet Log Lakehouse & Live Stream
+### 📊 5. Parquet Log Lakehouse & Live Stream
 - **Dual-Tier Ingestion**: Ingests logs from systemd journald, Docker socket, syslog, Vector, or application SDKs via `POST /api/v1/ingest`.
 - **Sub-Second Live Tail**: Real-time in-memory ring buffer streams live events to the web UI via Server-Sent Events (`/api/v1/live/sse`).
-- **Columnar R2 Storage**: Automatically compacts log streams into compressed Apache Parquet files in Cloudflare R2, enabling SQL queries with **zero egress costs**.
+- **Columnar R2 Storage**: Automatically compacts log streams into compressed Apache Parquet files in Cloudflare R2, enabling DuckDB-WASM SQL queries in the browser with **zero egress costs**.
 - **Resilient WAL**: Local Write-Ahead Log buffers data to disk during network blips, guaranteeing zero log loss.
 
-### 🔐 5. Zero-Trust Secrets Vault
-- **AES-GCM-256 Authenticated Encryption**: Secrets are stored encrypted in Cloudflare KV.
-- **In-Memory Injection**: Secrets are injected directly into container environment variables at launch time (`-e KEY=VAL`). They are **never written as cleartext `.env` files to the host hard drive**.
+### 🔐 6. Zero-Trust Secrets Vault & RAM Secret Files
+- **AES-GCM-256 Authenticated Encryption**: Secrets are stored encrypted in Cloudflare KV and merged with manifest `env_vars` at deploy time.
+- **In-Memory Env & `tmpfs` File Injection**: Secrets are injected directly into container environment variables (`-e KEY=VAL`) and ephemeral `/dev/shm` (`0700`/`0600`) RAM-backed files (`__FLARELENS_FILE__`) for PEM/SAML certificates — **never written to persistent host disks**.
 
-### 💾 6. Zero-Disk Streaming Database Backups
+### 💾 7. Zero-Disk Streaming Database Backups
 - **Memory-Piped `pg_dump`**: Streams compressed database backups directly into Cloudflare R2 via Go's `io.Pipe` and multipart S3 uploads.
 - **Prevents Node Crashes**: Eliminates temporary 20GB `.sql` files on `/tmp`, preventing disk-full failures during deployments.
 - **Host-Native & Container Support**: Works with both containerized PostgreSQL and host-native PostgreSQL installs.
 
-### 🛡️ 7. Host Kernel OOM Governance & System Health
+### 🛡️ 8. Host Kernel OOM Governance & System Health
 - **Self-Preservation**: Automatically sets `/proc/self/oom_score_adj = -1000` at startup on Linux so the host kernel never kills the FlareLens daemon under heavy load.
 - **Workload Score Ladder**: Proactively prioritizes container survival (`-900` for databases, `-800` for caches, `+500` for background workers).
-- **OS Kernel Patching & Reboot Detection**: Tracks `/var/run/reboot-required` on Linux and `RebootPending` registry keys on Windows.
+- **OS Kernel Patching & Reboot Detection**: Tracks `/var/run/reboot-required` on Linux and `RebootPending` registry keys on Windows, surfacing 1-click drain-locked reboots in the dashboard.
 
 ---
 
 ## 🚀 Getting Started
 
 Deploying FlareLens consists of two straightforward steps:
-1. **Deploy your Control Plane**: Run the serverless Worker on **your own Cloudflare account**.
-2. **Install the Agent on your Nodes**: Download the agent binary directly from **GitHub Releases** and point it to **your deployed Worker URL**.
+1. **Deploy your Control Plane**: Run the serverless Worker on **your own Cloudflare account** (`$0/month` free tier).
+2. **Install the Agent on your Nodes**: Download `flarelensd` directly from **GitHub Releases** and point it to **your deployed Worker URL**.
 
 ---
 
-### Step 1: Deploy Your Control Plane (Cloudflare Worker)
+### Step 1: Deploy Your Control Plane (Cloudflare Worker + D1 + KV + R2)
 
-FlareLens uses Cloudflare Workers, KV, and R2 as a 100% serverless, zero-maintenance control plane. You deploy this into **your own Cloudflare account** for complete data ownership and zero SaaS markup.
+FlareLens uses Cloudflare Workers, D1, KV, and R2 as a 100% serverless, zero-maintenance control plane. You deploy this into **your own Cloudflare account** for complete data ownership and zero SaaS markup.
 
 ```bash
-# 1. Clone the repository
+# 1. Clone the Control Plane repository
 git clone https://github.com/antwig2/flarelens.git
-cd flarelens/flarelens-worker
+cd flarelens
 
 # 2. Install dependencies
 npm install
 
-# 3. Create required Cloudflare KV namespace and R2 bucket
+# 3. Create Cloudflare D1 database, KV namespace, and R2 bucket
+npx wrangler d1 create flarelens-control
 npx wrangler kv namespace create FLEET_KV
 npx wrangler r2 bucket create flarelens-logs-cold
 
-# Ensure the KV ID returned above is set in wrangler.toml under [[kv_namespaces]]
+# Copy the returned database_id and KV id into wrangler.toml, then apply the D1 schema:
+npx wrangler d1 migrations apply flarelens-control --remote
 
-# 4. Set your dashboard password and ingest token
+# 4. Set your dashboard password, ingest token, and Vault master key
 npx wrangler secret put DASHBOARD_PASSWORD
 npx wrangler secret put INGEST_SECRET
+npx wrangler secret put VAULT_MASTER_KEY
 
 # 5. Deploy to your Cloudflare account
 npx wrangler deploy
@@ -330,7 +344,7 @@ Once your control plane is running, install `flarelens-agent` on your servers, V
 
 #### Option A: Download Pre-Built Binaries from GitHub Releases (Recommended)
 
-Standalone, statically compiled release binaries are hosted directly on **[GitHub Releases](https://github.com/antwig2/flarelens/releases)**:
+Standalone, statically compiled release binaries are hosted directly on **[GitHub Releases](https://github.com/antwig2/flarelensd/releases)**:
 
 | OS | Architecture | Binary Asset | Format |
 | :--- | :--- | :--- | :--- |
@@ -341,10 +355,10 @@ Standalone, statically compiled release binaries are hosted directly on **[GitHu
 | **macOS** | Intel (`amd64`) | `flarelens-agent-darwin-amd64` | `.tar.gz` |
 
 ```bash
-# Example: Download latest Linux amd64 binary directly from GitHub
-curl -L -o /usr/local/bin/flarelens-agent \
-  https://github.com/antwig2/flarelens/releases/latest/download/flarelens-agent-linux-amd64
-chmod +x /usr/local/bin/flarelens-agent
+# Example: Download latest Linux amd64 archive directly from GitHub
+curl -fsSL https://github.com/antwig2/flarelensd/releases/latest/download/flarelens-agent_linux_amd64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin flarelens-agent
+sudo chmod +x /usr/local/bin/flarelens-agent
 
 # Run agent pointing to YOUR deployed Cloudflare Worker URL
 flarelens-agent \
@@ -427,6 +441,9 @@ flarelens-agent --config /etc/flarelens/agent.yaml
 # Run in development mode with debug logging
 flarelens-agent --dev --log-level debug
 
+# Perform an Over-The-Air SHA-256 verified binary upgrade
+sudo flarelens-agent self-update --control https://<your-worker-subdomain>.workers.dev
+
 # Connect to YOUR deployed control plane and specify WireGuard mesh port
 flarelens-agent --control-url https://<your-worker-subdomain>.workers.dev --mesh-port 51820
 ```
@@ -437,13 +454,13 @@ flarelens-agent --control-url https://<your-worker-subdomain>.workers.dev --mesh
 
 ### Prerequisites
 
-- Go 1.22 or later
+- Go 1.23 or later
 - Docker (optional, for Blue/Green container tests)
 
 ```bash
 # Clone repository
-git clone https://github.com/antwig2/flarelens.git
-cd flarelens
+git clone https://github.com/antwig2/flarelensd.git
+cd flarelensd
 
 # Run test suite
 go test -v ./...

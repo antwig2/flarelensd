@@ -1208,3 +1208,57 @@ func TestDiscoverTraefikRoutesDirNestedRoutesSubdir(t *testing.T) {
 		t.Fatalf("Expected DiscoverTraefikRoutesDir=%q, got %q", nestedRoutesDir, got)
 	}
 }
+
+func TestTraefikSwitchRouteWithMultiDomainsAndRuleAugmentation(t *testing.T) {
+	routesDir := t.TempDir()
+	flipper := NewTraefikRouteFlipper(routesDir)
+
+	// Case 1: Greenfield route file generation with multiple domains
+	if err := flipper.SwitchRouteWithDomains("prod", "billing-svc", "billing-svc-green", 8081, []string{"api.example.com", "auth.example.com"}, "bill-api"); err != nil {
+		t.Fatalf("SwitchRouteWithDomains greenfield failed: %v", err)
+	}
+	generated, err := os.ReadFile(filepath.Join(routesDir, "prod-billing-svc.yaml"))
+	if err != nil {
+		t.Fatalf("read generated route: %v", err)
+	}
+	genStr := string(generated)
+	if !strings.Contains(genStr, "Host(`api.example.com`) || Host(`auth.example.com`)") {
+		t.Fatalf("expected multi-host rule in generated YAML, got:\n%s", genStr)
+	}
+	if !strings.Contains(genStr, "http://billing-svc-green:8081") {
+		t.Fatalf("expected upstream http://billing-svc-green:8081, got:\n%s", genStr)
+	}
+
+	// Case 2: Existing alias route file missing migrated domains gets augmented in place without losing legacy rules
+	legacyPath := filepath.Join(routesDir, "prod-portal-ui.yml")
+	legacyYAML := `http:
+  routers:
+    prod-portal-ui:
+      rule: "(HostRegexp(` + "`{org:[a-z0-9-]+}.legacy.io`" + `)) && (PathPrefix(` + "`/portal`" + `))"
+      entryPoints:
+        - web
+      service: prod-portal-ui
+  services:
+    prod-portal-ui:
+      loadBalancer:
+        servers:
+          - url: http://legacy-portal-blue:80
+`
+	if err := os.WriteFile(legacyPath, []byte(legacyYAML), 0644); err != nil {
+		t.Fatalf("write legacy route: %v", err)
+	}
+	if err := flipper.SwitchRouteWithDomains("prod", "portal-ui", "portal-ui-green", 80, []string{"portal.example.com"}); err != nil {
+		t.Fatalf("SwitchRouteWithDomains legacy augment failed: %v", err)
+	}
+	augmentedRaw, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatalf("read augmented route: %v", err)
+	}
+	augStr := string(augmentedRaw)
+	if !strings.Contains(augStr, "http://portal-ui-green:80") {
+		t.Fatalf("expected updated upstream http://portal-ui-green:80, got:\n%s", augStr)
+	}
+	if !strings.Contains(augStr, "HostRegexp") || !strings.Contains(augStr, "Host(`portal.example.com`)") {
+		t.Fatalf("expected both preserved HostRegexp and appended Host(`portal.example.com`), got:\n%s", augStr)
+	}
+}
