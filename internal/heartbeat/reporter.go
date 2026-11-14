@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/antwig2/flarelens/internal/config"
@@ -38,6 +41,18 @@ type NodeTelemetryHeartbeat struct {
 	Containers    []docker.ContainerSummary `json:"containers"`
 }
 
+// SyncResponse represents the piggybacked control-plane payload returned by POST /api/v1/ingest.
+type SyncResponse struct {
+	Status       string            `json:"status"`
+	Count        int               `json:"count"`
+	Commands     []json.RawMessage `json:"commands"`
+	FlagsVersion *string           `json:"flags_version"`
+}
+
+// SyncHandler processes piggybacked commands and feature-flag version markers returned on each HTTP heartbeat.
+// piggybacked is true when the control plane includes flags_version in its ingest response.
+type SyncHandler func(ctx context.Context, commands []json.RawMessage, flagsVersion string, piggybacked bool)
+
 // Reporter coordinates periodic heartbeats and initial node enrollment
 type Reporter struct {
 	cfg        *config.Config
@@ -47,6 +62,15 @@ type Reporter struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	version    string
+	syncMu     sync.RWMutex
+	onSync     SyncHandler
+}
+
+// SetSyncHandler registers a callback invoked with piggybacked commands and flags_version after each HTTP heartbeat.
+func (r *Reporter) SetSyncHandler(fn SyncHandler) {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	r.onSync = fn
 }
 
 // NewReporter creates a new telemetry reporter
@@ -167,16 +191,21 @@ func (r *Reporter) StartHeartbeatLoop(ctx context.Context) {
 }
 
 func (r *Reporter) sendHeartbeat(ctx context.Context) {
-	metrics := r.sampler.Sample()
+	var metrics system.MetricsSnapshot
+	if r.sampler != nil {
+		metrics = r.sampler.Sample()
+	}
 
 	// Check Docker health and inspect running containers
 	dockerHealthy := false
 	var containers []docker.ContainerSummary
 
-	if err := r.inspector.Ping(ctx); err == nil {
-		dockerHealthy = true
-		if list, err := r.inspector.ListContainers(ctx, false); err == nil {
-			containers = list
+	if r.inspector != nil {
+		if err := r.inspector.Ping(ctx); err == nil {
+			dockerHealthy = true
+			if list, err := r.inspector.ListContainers(ctx, false); err == nil {
+				containers = list
+			}
 		}
 	}
 
@@ -197,7 +226,7 @@ func (r *Reporter) sendHeartbeat(ctx context.Context) {
 		Containers:    containers,
 	}
 
-	// 1. Stream over NATS (Primary path)
+	// 1. Stream over NATS when connected (local or cluster event fabric)
 	publishedViaNATS := false
 	if r.natsClient != nil && r.natsClient.IsConnected() {
 		subject := fmt.Sprintf("flarelens.node.%s.telemetry", r.cfg.Identity.NodeID)
@@ -208,8 +237,8 @@ func (r *Reporter) sendHeartbeat(ctx context.Context) {
 		}
 	}
 
-	// 2. HTTP ingest fallback if NATS is unavailable
-	if !publishedViaNATS && r.cfg.ControlPlane.Endpoint != "" {
+	// 2. Always sync with HTTPS Control Plane when configured so piggybacked commands and flags_version arrive on the 15s heartbeat
+	if r.cfg.ControlPlane.Endpoint != "" {
 		r.sendHTTPTelemetry(ctx, payload)
 	}
 
@@ -224,14 +253,14 @@ func (r *Reporter) sendHeartbeat(ctx context.Context) {
 }
 
 func (r *Reporter) sendHTTPTelemetry(ctx context.Context, payload NodeTelemetryHeartbeat) {
-	url := fmt.Sprintf("%s/api/v1/ingest", r.cfg.ControlPlane.Endpoint)
+	url := fmt.Sprintf("%s/api/v1/ingest", strings.TrimRight(r.cfg.ControlPlane.Endpoint, "/"))
 
 	data, err := json.Marshal([]any{payload})
 	if err != nil {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return
 	}
@@ -244,5 +273,33 @@ func (r *Reporter) sendHTTPTelemetry(ctx context.Context, payload NodeTelemetryH
 	if err != nil {
 		return
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+
+	r.syncMu.RLock()
+	handler := r.onSync
+	r.syncMu.RUnlock()
+	if handler == nil {
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil || len(body) == 0 {
+		return
+	}
+
+	var syncResp SyncResponse
+	if err := json.Unmarshal(body, &syncResp); err != nil {
+		return
+	}
+
+	flagsVersion := ""
+	piggybacked := syncResp.FlagsVersion != nil
+	if piggybacked {
+		flagsVersion = *syncResp.FlagsVersion
+	}
+	handler(ctx, syncResp.Commands, flagsVersion, piggybacked)
 }

@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "2.1.0"
+	Version = "0.2.1"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -577,19 +577,16 @@ func main() {
 		logger.Warn("Node enrollment warning", "error", err)
 	}
 
-	// 6. Launch background telemetry heartbeat loop (every 15s)
+	// 6. Configure piggybacked command & feature-flag synchronization on the 15s heartbeat loop
+	configureControlPlaneSync(ctx, reporter, flagStore, backupMgr, deployOrchestrator, agentUpdater, cfg, logger)
+
+	// 6a. Launch background telemetry + piggybacked control-plane sync loop (every 15s)
 	go reporter.StartHeartbeatLoop(ctx)
 
-	// 6a. Reconcile stable Docker DNS aliases for already-running containers on host startup
+	// 6b. Reconcile stable Docker DNS aliases for already-running containers on host startup
 	go deployOrchestrator.ReconcileActiveAliases(ctx)
 
-	// 6b. Launch background command poller loop (polls control plane every 3s for UI snapshots, restores, deployments & OTA updates)
-	go startCommandPoller(ctx, backupMgr, deployOrchestrator, agentUpdater, cfg, logger)
-
-	// 6c. Launch background Feature Flags sync daemon (polls control plane every 5s & syncs to /etc/flarelens/flags)
-	go startFlagSyncDaemon(ctx, flagStore, cfg, logger)
-
-	// 6d. Launch local zero-latency Feature Flags edge daemon (HTTP on 0.0.0.0:8999 for containers)
+	// 6c. Launch local zero-latency Feature Flags edge daemon (HTTP on 0.0.0.0:8999 for containers)
 	go startLocalFlagsServer(ctx, flagStore, logger)
 
 	// 7. Handle OS Signals (Graceful shutdown & SIGHUP hot reload on Unix)
@@ -1087,32 +1084,94 @@ type CommandsResponse struct {
 	Commands []NodeCommand `json:"commands"`
 }
 
-func startCommandPoller(ctx context.Context, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, agentUpdater *updater.Updater, cfg *config.Config, logger *slog.Logger) {
+func configureControlPlaneSync(
+	ctx context.Context,
+	reporter *heartbeat.Reporter,
+	flagStore *flags.Store,
+	backupMgr *backup.Manager,
+	orchestrator *deploy.Orchestrator,
+	agentUpdater *updater.Updater,
+	cfg *config.Config,
+	logger *slog.Logger,
+) {
 	if cfg.ControlPlane.Endpoint == "" {
 		return
 	}
-	logger.Info("Starting FlareLens command poller loop", "endpoint", cfg.ControlPlane.Endpoint, "node_id", cfg.Identity.NodeID)
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	nodeID := cfg.Identity.NodeID
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pollAndExecuteCommands(ctx, client, backupMgr, orchestrator, agentUpdater, cfg, nodeID, logger)
+	var syncMu sync.Mutex
+	initialFlagsSynced := syncFlagsOnce(ctx, client, flagStore, cfg, logger)
+	lastFlagsVersion := ""
+	var lastLegacyPoll time.Time
+
+	logger.Info("Configured consolidated 15s heartbeat control-plane sync",
+		"endpoint", cfg.ControlPlane.Endpoint,
+		"node_id", nodeID,
+		"initial_flags_synced", initialFlagsSynced,
+	)
+
+	reporter.SetSyncHandler(func(hbCtx context.Context, rawCommands []json.RawMessage, flagsVersion string, piggybacked bool) {
+		if len(rawCommands) > 0 {
+			cmds := make([]NodeCommand, 0, len(rawCommands))
+			for _, raw := range rawCommands {
+				var c NodeCommand
+				if err := json.Unmarshal(raw, &c); err == nil && c.ID != "" {
+					cmds = append(cmds, c)
+				}
+			}
+			if len(cmds) > 0 {
+				dispatchNodeCommands(cmds, client, backupMgr, orchestrator, agentUpdater, cfg, nodeID, logger)
+			}
 		}
-	}
+
+		syncMu.Lock()
+		defer syncMu.Unlock()
+
+		if piggybacked {
+			if flagsVersion == "" {
+				return
+			}
+			if !initialFlagsSynced {
+				if syncFlagsOnce(hbCtx, client, flagStore, cfg, logger) {
+					initialFlagsSynced = true
+					lastFlagsVersion = flagsVersion
+				}
+				return
+			}
+			if lastFlagsVersion == "" {
+				lastFlagsVersion = flagsVersion
+				return
+			}
+			if flagsVersion != lastFlagsVersion {
+				logger.Info("Feature flags version changed on control plane; syncing flags",
+					"prev_version", lastFlagsVersion,
+					"new_version", flagsVersion,
+				)
+				if syncFlagsOnce(hbCtx, client, flagStore, cfg, logger) {
+					lastFlagsVersion = flagsVersion
+				}
+			}
+			return
+		}
+
+		// Legacy fallback: only used when connected to an older control plane that omits flags_version
+		if time.Since(lastLegacyPoll) >= 30*time.Second {
+			lastLegacyPoll = time.Now()
+			pollAndExecuteCommands(hbCtx, client, backupMgr, orchestrator, agentUpdater, cfg, nodeID, logger)
+			if syncFlagsOnce(hbCtx, client, flagStore, cfg, logger) {
+				initialFlagsSynced = true
+			}
+		}
+	})
 }
 
 var inFlightCommands sync.Map
 
 func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, agentUpdater *updater.Updater, cfg *config.Config, nodeID string, logger *slog.Logger) {
 	reqURL := fmt.Sprintf("%s/api/v1/control/commands?node_id=%s", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"), url.QueryEscape(nodeID))
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return
 	}
@@ -1135,7 +1194,11 @@ func pollAndExecuteCommands(ctx context.Context, client *http.Client, backupMgr 
 		return
 	}
 
-	for _, cmd := range cmdResp.Commands {
+	dispatchNodeCommands(cmdResp.Commands, client, backupMgr, orchestrator, agentUpdater, cfg, nodeID, logger)
+}
+
+func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *backup.Manager, orchestrator *deploy.Orchestrator, agentUpdater *updater.Updater, cfg *config.Config, nodeID string, logger *slog.Logger) {
+	for _, cmd := range cmds {
 		if _, loaded := inFlightCommands.LoadOrStore(cmd.ID, true); loaded {
 			continue // Already in-flight
 		}
@@ -1394,55 +1457,37 @@ func ackCommand(cfg *config.Config, client *http.Client, cmdID string, nodeID st
 	}
 }
 
-func startFlagSyncDaemon(ctx context.Context, store *flags.Store, cfg *config.Config, logger *slog.Logger) {
+func syncFlagsOnce(ctx context.Context, client *http.Client, store *flags.Store, cfg *config.Config, logger *slog.Logger) bool {
 	if cfg.ControlPlane.Endpoint == "" {
-		return
+		return false
 	}
-	logger.Info("Starting FlareLens feature flags synchronizer daemon", "endpoint", cfg.ControlPlane.Endpoint)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	client := &http.Client{Timeout: 10 * time.Second}
 	flagsURL := fmt.Sprintf("%s/api/v1/control/flags", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"))
-
-	syncFlags := func() {
-		req, err := http.NewRequestWithContext(ctx, "GET", flagsURL, nil)
-		if err != nil {
-			return
-		}
-		if cfg.ControlPlane.EnrollToken != "" {
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", cfg.ControlPlane.EnrollToken))
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		if err := store.UpdateFromJSON(body); err == nil {
-			if syncErr := store.SyncToFile("/etc/flarelens/flags"); syncErr != nil {
-				logger.Debug("Sync flags to /etc/flarelens/flags notice", "error", syncErr)
-			}
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, flagsURL, nil)
+	if err != nil {
+		return false
 	}
-
-	// Immediate initial sync
-	syncFlags()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			syncFlags()
-		}
+	if cfg.ControlPlane.EnrollToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", cfg.ControlPlane.EnrollToken))
 	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	if err := store.UpdateFromJSON(body); err != nil {
+		return false
+	}
+	if syncErr := store.SyncToFile("/etc/flarelens/flags"); syncErr != nil {
+		logger.Debug("Sync flags to /etc/flarelens/flags notice", "error", syncErr)
+	}
+	return true
 }
 
 func startLocalFlagsServer(ctx context.Context, store *flags.Store, logger *slog.Logger) {
