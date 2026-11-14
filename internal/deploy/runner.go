@@ -989,27 +989,21 @@ func (r *DockerRunner) DiscoverTraefikRoutesDir(ctx context.Context) string {
 			continue
 		}
 
-		// 1. Direct mount targeting a dynamic or routes directory inside Traefik
+		// Inspect mounts under /etc/traefik* (skipping acme/certs dirs) and prefer deepest routes/dynamic subdir
 		for _, m := range c.Mounts {
-			dest := strings.ToLower(filepath.ToSlash(m.Destination))
-			if (strings.Contains(dest, "routes") || strings.Contains(dest, "dynamic")) && isExistingDir(m.Source) {
-				return m.Source
+			dest := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(m.Destination)), "/")
+			if !strings.HasPrefix(dest, "/etc/traefik") || strings.Contains(dest, "acme") || !isExistingDir(m.Source) {
+				continue
 			}
-		}
-
-		// 2. Mount targeting /etc/traefik root directory — check standard route subdirectories on host
-		for _, m := range c.Mounts {
-			dest := strings.TrimSuffix(filepath.ToSlash(m.Destination), "/")
-			if dest == "/etc/traefik" && isExistingDir(m.Source) {
-				subCandidates := []string{
-					filepath.Join(m.Source, "routes"),
-					filepath.Join(m.Source, "dynamic", "routes"),
-					filepath.Join(m.Source, "dynamic"),
-				}
-				for _, sub := range subCandidates {
-					if isExistingDir(sub) {
-						return sub
-					}
+			subCandidates := []string{
+				filepath.Join(m.Source, "routes"),
+				filepath.Join(m.Source, "dynamic", "routes"),
+				filepath.Join(m.Source, "dynamic"),
+				m.Source,
+			}
+			for _, sub := range subCandidates {
+				if isExistingDir(sub) {
+					return sub
 				}
 			}
 		}

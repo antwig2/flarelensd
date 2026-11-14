@@ -1163,3 +1163,48 @@ func TestTraefikAliasSwitchAndRAMSecretFiles(t *testing.T) {
 		t.Errorf("Expected RAM secret file bind :/app/config:ro in %v", binds)
 	}
 }
+
+func TestDiscoverTraefikRoutesDirNestedRoutesSubdir(t *testing.T) {
+	hostTraefikRoot := t.TempDir()
+	nestedRoutesDir := filepath.Join(hostTraefikRoot, "routes")
+	acmeDir := filepath.Join(hostTraefikRoot, "acme")
+	if err := os.MkdirAll(nestedRoutesDir, 0755); err != nil {
+		t.Fatalf("mkdir routes: %v", err)
+	}
+	if err := os.MkdirAll(acmeDir, 0755); err != nil {
+		t.Fatalf("mkdir acme: %v", err)
+	}
+
+	sockPath := filepath.Join(t.TempDir(), "docker-traefik.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"Id":    "id-traefik",
+				"Names": []string{"/edge-traefik"},
+				"Image": "traefik:v3.6",
+				"State": "running",
+				"Mounts": []map[string]any{
+					{"Source": acmeDir, "Destination": "/etc/traefik/acme"},
+					{"Source": hostTraefikRoot, "Destination": "/etc/traefik/dynamic"},
+				},
+			},
+		})
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	runner := NewDockerRunner("unix://" + sockPath)
+	got := runner.DiscoverTraefikRoutesDir(t.Context())
+	if got != nestedRoutesDir {
+		t.Fatalf("Expected DiscoverTraefikRoutesDir=%q, got %q", nestedRoutesDir, got)
+	}
+}

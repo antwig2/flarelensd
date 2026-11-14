@@ -58,6 +58,10 @@ func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, tar
 
 	for _, p := range candidates {
 		if updated, err := updateTraefikRouteFileURL(p, targetURL); err == nil && updated {
+			// Clean up any stray fallback route file previously written in parent dir when dynamicDir ends with /routes
+			if filepath.Base(t.dynamicDir) == "routes" {
+				_ = os.Remove(filepath.Join(filepath.Dir(t.dynamicDir), fmt.Sprintf("%s-%s.yaml", stack, service)))
+			}
 			return nil
 		}
 	}
