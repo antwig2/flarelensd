@@ -1015,3 +1015,151 @@ func TestReconcileSingletonCreatesHealsAndProtectsStateful(t *testing.T) {
 		t.Errorf("Expected zero additional stops on host-network idempotent re-reconcile, got total stops=%d", stopsAfterHostNoop)
 	}
 }
+
+func TestLegacySlotAndPortDetectionAndWorkerEviction(t *testing.T) {
+	containers := []RunningContainerSummary{
+		{
+			ID:       "id-legacy-api-green",
+			Names:    []string{"acme-uat-billing-api-green"},
+			State:    "running",
+			Networks: map[string][]string{"acme-uat": {}, "acme-edge": {}},
+		},
+		{
+			ID:       "id-legacy-drainer",
+			Names:    []string{"acme-uat-job-drainer"},
+			State:    "running",
+			Networks: map[string][]string{"acme-uat": {}},
+		},
+		{
+			ID:       "id-prod-drainer",
+			Names:    []string{"acme-prod-job-drainer"},
+			State:    "running",
+			Networks: map[string][]string{"acme-prod": {}},
+		},
+		{
+			ID:       "id-postgres",
+			Names:    []string{"acme-uat-postgres"},
+			State:    "running",
+			Networks: map[string][]string{"acme-uat": {}},
+		},
+	}
+
+	aliases := []string{"billing", "billing-uat", "billing-api", "acme-uat-billing-api"}
+	workers := []WorkerSpec{{Name: "job-drainer", Networks: []string{"acme-uat"}}}
+
+	matched := identifyServiceSlotContainers(
+		containers,
+		"billing",
+		"billing",
+		"uat",
+		aliases,
+		[]string{"acme-uat", "acme-edge"},
+		workers,
+	)
+	if len(matched) != 1 || matched[0].container.ID != "id-legacy-api-green" || matched[0].slot != SlotGreen {
+		t.Fatalf("Expected strictly acme-uat-billing-api-green as SlotGreen, got %+v", matched)
+	}
+
+	activeSlot := detectActiveServiceSlot(matched, containers, "", false, 8082, 8083)
+	if activeSlot != SlotGreen {
+		t.Fatalf("Expected activeSlot=SlotGreen so candidate stages onto SlotBlue, got %s", activeSlot)
+	}
+
+	// Verify managed slot takes precedence over lingering legacy opposite slot
+	mixed := []RunningContainerSummary{
+		{
+			ID:       "id-managed-green",
+			Names:    []string{"portal-ui-green"},
+			State:    "running",
+			Labels:   map[string]string{"flarelens.service": "portal-ui", "flarelens.slot": "green", "flarelens.env": "uat"},
+			Networks: map[string][]string{"acme-uat": {}, "acme-edge": {}},
+		},
+		{
+			ID:       "id-legacy-blue",
+			Names:    []string{"acme-uat-portal-ui-blue"},
+			State:    "running",
+			Networks: map[string][]string{"acme-uat": {}, "acme-edge": {}},
+		},
+	}
+	matchedMixed := identifyServiceSlotContainers(
+		mixed,
+		"portal-ui",
+		"portal-ui",
+		"uat",
+		[]string{"portal-ui", "acme-uat-portal-ui"},
+		[]string{"acme-uat", "acme-edge"},
+		nil,
+	)
+	if len(matchedMixed) != 2 {
+		t.Fatalf("Expected 2 matched slot containers (managed + legacy), got %d", len(matchedMixed))
+	}
+	if got := detectActiveServiceSlot(matchedMixed, mixed, "", false, 8091, 8092); got != SlotGreen {
+		t.Fatalf("Expected managed green slot to win over legacy blue slot, got %s", got)
+	}
+
+	// Verify companion worker legacy match isolates environment strictly
+	if !isLegacyCompanionWorkerContainer(containers[1], "job-drainer", "uat", []string{"acme-uat"}) {
+		t.Errorf("Expected acme-uat-job-drainer to match uat job-drainer")
+	}
+	if isLegacyCompanionWorkerContainer(containers[2], "job-drainer", "uat", []string{"acme-uat"}) {
+		t.Errorf("Expected acme-prod-job-drainer NOT to match uat job-drainer")
+	}
+}
+
+func TestTraefikAliasSwitchAndRAMSecretFiles(t *testing.T) {
+	routesDir := t.TempDir()
+	existingRoute := filepath.Join(routesDir, "uat-billing-api.yml")
+	initialYAML := `http:
+  routers:
+    uat-billing-api:
+      rule: "Host(` + "`api-uat.example.com`" + `) || Host(` + "`auth-uat.example.com`" + `)"
+      entryPoints:
+        - web
+      service: uat-billing-api
+  services:
+    uat-billing-api:
+      loadBalancer:
+        servers:
+          - url: http://acme-uat-billing-api-green:8081
+`
+	if err := os.WriteFile(existingRoute, []byte(initialYAML), 0644); err != nil {
+		t.Fatalf("write route: %v", err)
+	}
+
+	flipper := NewTraefikRouteFlipper(routesDir)
+	if err := flipper.SwitchRoute("uat", "billing", "billing-blue", 8081, "api-uat.example.com", "billing-api"); err != nil {
+		t.Fatalf("SwitchRoute failed: %v", err)
+	}
+
+	updatedBytes, err := os.ReadFile(existingRoute)
+	if err != nil {
+		t.Fatalf("read updated route: %v", err)
+	}
+	updated := string(updatedBytes)
+	if !strings.Contains(updated, "url: http://billing-blue:8081") {
+		t.Errorf("Expected uat-billing-api.yml upstream URL to flip to http://billing-blue:8081, got:\n%s", updated)
+	}
+	if !strings.Contains(updated, "auth-uat.example.com") {
+		t.Errorf("Expected multi-host rule to remain intact, got:\n%s", updated)
+	}
+
+	// Verify RAM secret file materialization when host volume does not already mount /app/config
+	binds := resolveVolumeBinds(nil, "uat", "blue", "billing-test", map[string]string{
+		"/app/config/jwt-private.pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n",
+	})
+	foundConfigBind := false
+	for _, b := range binds {
+		if strings.HasSuffix(b, ":/app/config:ro") {
+			foundConfigBind = true
+			hostDir := strings.Split(b, ":")[0]
+			data, readErr := os.ReadFile(filepath.Join(hostDir, "jwt-private.pem"))
+			if readErr != nil || !strings.Contains(string(data), "BEGIN PRIVATE KEY") {
+				t.Errorf("Expected materialized jwt-private.pem in %s, err=%v", hostDir, readErr)
+			}
+			_ = os.RemoveAll(hostDir)
+		}
+	}
+	if !foundConfigBind {
+		t.Errorf("Expected RAM secret file bind :/app/config:ro in %v", binds)
+	}
+}

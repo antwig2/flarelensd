@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -179,31 +180,64 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		profile.Workers = req.Workers
 	}
 
-	// 2. Identify active slot and target candidate slot
+	// 2. Identify active slot, legacy containers, and target candidate slot
 	baseServiceName := profile.BaseService
 	slotGreenName := fmt.Sprintf("%s-%s-green", baseServiceName, envName)
 	slotBlueName := fmt.Sprintf("%s-%s-blue", baseServiceName, envName)
 
+	portBlue := cmp.Or(req.HostPortBlue, profile.HostPortBlue, profile.ContainerPort+1)
+	portGreen := cmp.Or(req.HostPortGreen, profile.HostPortGreen, profile.ContainerPort+2)
+
+	allContainers, _ := o.runner.ListAllContainers(ctx)
+	matchedSlots := identifyServiceSlotContainers(
+		allContainers,
+		req.Service,
+		baseServiceName,
+		envName,
+		profile.Aliases,
+		profile.Networks,
+		profile.Workers,
+	)
+
 	o.mu.Lock()
-	currentSlot, exists := o.activeSlots[req.Service]
-	if !exists {
-		// Detect by container presence on host
+	knownSlot, hasKnown := o.activeSlots[req.Service]
+	currentSlot := detectActiveServiceSlot(
+		matchedSlots,
+		allContainers,
+		knownSlot,
+		hasKnown,
+		portBlue,
+		portGreen,
+	)
+	if len(matchedSlots) == 0 && !hasKnown {
+		// Backwards-compatible direct name lookup when container listing is unavailable (e.g. unit test mocks)
 		if id, _ := o.runner.FindContainerIDByName(ctx, slotGreenName); id != "" {
 			currentSlot = SlotGreen
 		} else if id, _ := o.runner.FindContainerIDByName(ctx, fmt.Sprintf("%s-green", req.Service)); id != "" {
 			currentSlot = SlotGreen
 		} else if id, _ := o.runner.FindContainerIDByName(ctx, slotBlueName); id != "" {
 			currentSlot = SlotBlue
-		} else {
-			currentSlot = SlotBlue
 		}
 	}
 	candidateSlot := currentSlot.Invert()
-	o.mu.Unlock()
 
-	// Determine host ports for slots
-	portBlue := cmp.Or(req.HostPortBlue, profile.HostPortBlue, profile.ContainerPort+1)
-	portGreen := cmp.Or(req.HostPortGreen, profile.HostPortGreen, profile.ContainerPort+2)
+	// Defensive host-port collision avoidance when an unrelated container occupies candidateSlot's port
+	if !req.IsPreview {
+		candPort := o.portForSlot(candidateSlot, portBlue, portGreen)
+		oppPort := o.portForSlot(currentSlot, portBlue, portGreen)
+		if isHostPortBoundByUnrelatedRunning(allContainers, matchedSlots, candPort) &&
+			!isHostPortBound(allContainers, oppPort) &&
+			!hasRunningSlotContainerOnPort(matchedSlots, currentSlot, oppPort) {
+			o.logger.Warn("Candidate host port occupied by unrelated container; switching candidate to free opposite slot",
+				"occupied_port", candPort,
+				"free_port", oppPort,
+				"new_candidate_slot", currentSlot,
+			)
+			candidateSlot = currentSlot
+			currentSlot = candidateSlot.Invert()
+		}
+	}
+	o.mu.Unlock()
 
 	candidatePort := portGreen
 	if candidateSlot == SlotBlue {
@@ -237,11 +271,21 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	// When secrets are provided by FlareLens Control Plane, use them as authoritative (RAM-only).
 	// Fall back to host .env files ONLY when FlareLens Control Plane provides zero secrets.
 	activeSecrets := make(map[string]string)
+	secretFiles := make(map[string]string)
 	if len(req.Secrets) > 0 {
 		for k, v := range req.Secrets {
+			if after, ok := strings.CutPrefix(k, "__FLARELENS_FILE__"); ok {
+				if cleanPath := strings.TrimSpace(after); cleanPath != "" && v != "" {
+					secretFiles[cleanPath] = v
+				}
+				continue
+			}
 			activeSecrets[k] = v
 		}
-		o.logger.Info("Injected in-memory secrets from FlareLens Control Plane", "count", len(req.Secrets))
+		o.logger.Info("Injected in-memory secrets from FlareLens Control Plane",
+			"count", len(activeSecrets),
+			"secret_files", len(secretFiles),
+		)
 	} else {
 		activeSecrets = loadFallbackEnv(baseServiceName, envName, string(candidateSlot))
 		if activeSecrets == nil {
@@ -275,6 +319,9 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		envList = append(envList, fmt.Sprintf("%s=%s", k, v))
 	}
 
+	// Resolve volume binds (format slot-specific volume paths if present, plus RAM tmpfs secret files when needed)
+	resolvedBinds := resolveVolumeBinds(profile.Volumes, envName, string(candidateSlot), baseServiceName, secretFiles)
+
 	if targetDB == "" {
 		targetDB = cmp.Or(
 			envValueByKeyOrSuffix(activeSecrets, "DB_NAME"),
@@ -291,7 +338,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		if migCmd != "" {
 			_ = o.runner.EnsureNetwork(ctx, dbNetwork)
 			o.emitProgress(req, "migrating", fmt.Sprintf("Executing database schema migration: %s", migCmd), 25)
-			migrationOutput, err := o.migrator.Run(ctx, req.Image, migCmd, envList, dbNetwork)
+			migrationOutput, err := o.migrator.Run(ctx, req.Image, migCmd, envList, dbNetwork, resolvedBinds...)
 			if err != nil {
 				o.logger.Error("Database schema migration failed! Aborting deployment", "error", err, "output", migrationOutput)
 
@@ -314,38 +361,26 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 
 	o.emitProgress(req, "starting", fmt.Sprintf("Staging candidate container: %s", candidateName), 40)
 
-	// 6. Remove stale candidate container if one was lingering from previous failed run
+	// 6. Remove stale candidate container or inactive legacy slot containers occupying candidateSlot / candidatePort
 	if oldID, _ := o.runner.FindContainerIDByName(ctx, candidateName); oldID != "" {
+		_ = o.runner.StopContainer(ctx, oldID, 5)
 		_ = o.runner.RemoveContainer(ctx, oldID)
 	}
-
-	// Resolve volume binds (format slot-specific volume paths if present)
-	resolvedBinds := make([]string, 0, len(profile.Volumes))
-	for _, b := range profile.Volumes {
-		formattedBind := b
-		if strings.Contains(formattedBind, "%s") {
-			formattedBind = fmt.Sprintf(formattedBind, envName, candidateSlot)
-		}
-		// Verify source path exists on host before binding
-		parts := strings.Split(formattedBind, ":")
-		if len(parts) > 0 {
-			if _, statErr := os.Stat(parts[0]); statErr == nil {
-				resolvedBinds = append(resolvedBinds, formattedBind)
+	if !req.IsPreview {
+		for _, m := range matchedSlots {
+			if m.slot == candidateSlot {
+				o.logger.Info("Evicting inactive slot container before candidate staging",
+					"container", m.primaryName,
+					"slot", m.slot,
+				)
+				_ = o.runner.StopContainer(ctx, m.container.ID, 5)
+				_ = o.runner.RemoveContainer(ctx, m.container.ID)
 			}
 		}
-	}
-
-	// Mount host feature flags directory read-only into container if present
-	if _, statErr := os.Stat("/etc/flarelens/flags"); statErr == nil {
-		hasFlagBind := false
-		for _, b := range resolvedBinds {
-			if strings.HasPrefix(b, "/etc/flarelens/flags") {
-				hasFlagBind = true
-				break
+		for _, c := range allContainers {
+			if !strings.EqualFold(c.State, "running") && containerHasHostPort(c, candidatePort) {
+				_ = o.runner.RemoveContainer(ctx, c.ID)
 			}
-		}
-		if !hasFlagBind {
-			resolvedBinds = append(resolvedBinds, "/etc/flarelens/flags:/etc/flarelens/flags:ro")
 		}
 	}
 
@@ -460,14 +495,14 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		soakDuration := time.Duration(cmp.Or(req.CanaryDuration, 5)) * time.Second
 		select {
 		case <-ctx.Done():
-			_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain)
+			_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain, profile.Aliases...)
 			_ = o.runner.StopContainer(ctx, containerID, 2)
 			_ = o.runner.RemoveContainer(ctx, containerID)
 			return o.failResponse(req, "Deployment cancelled during canary soak", currentSlot, startTime)
 		case <-time.After(soakDuration):
 			if err := o.prober.Probe(ctx, probeURL, 5*time.Second, 500*time.Millisecond); err != nil {
 				o.logger.Warn("Candidate failed during canary soak! Rolling back to 100% live", "error", err)
-				_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain)
+				_ = o.traefik.SwitchRoute(envName, baseServiceName, prevName, profile.ContainerPort, req.Domain, profile.Aliases...)
 				_ = o.runner.StopContainer(ctx, containerID, 2)
 				_ = o.runner.RemoveContainer(ctx, containerID)
 				return DeployResponse{
@@ -502,7 +537,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 
 	// Zero-Downtime Traffic Switch in Traefik
 	o.emitProgress(req, "flipping", fmt.Sprintf("Candidate healthy! Atomically flipping live route to %s (%s)", candidateName, candidateSlot), 88)
-	if err := o.traefik.SwitchRoute(envName, baseServiceName, candidateName, profile.ContainerPort, req.Domain); err != nil {
+	if err := o.traefik.SwitchRoute(envName, baseServiceName, candidateName, profile.ContainerPort, req.Domain, profile.Aliases...); err != nil {
 		o.logger.Warn("Traefik SwitchRoute warning, trying FlipRoute fallback", "error", err)
 		if req.Domain != "" {
 			_ = o.traefik.FlipRoute(candidateName, req.Domain, candidatePort)
@@ -518,23 +553,40 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	for _, worker := range profile.Workers {
 		workerName := fmt.Sprintf("%s-%s", worker.Name, envName)
 		o.emitProgress(req, "worker", fmt.Sprintf("Rolling out companion worker: %s", workerName), 92)
-		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks)
+		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles)
 	}
 
-	// 12. Drain and stop previous web slot
+	// 12. Drain, stop, and remove previous web slot(s) (both canonical and legacy pre-GitOps slots)
 	drainSec := cmp.Or(req.DrainSeconds, 15)
 	o.emitProgress(req, "draining", fmt.Sprintf("Draining previous slot %s for %d seconds...", currentSlot, drainSec), 95)
 
-	go func(oldContainerName string, drainTime time.Duration) {
+	retiredNames := []string{prevName}
+	for _, m := range matchedSlots {
+		if m.container.ID != containerID && m.primaryName != "" && m.primaryName != candidateName {
+			if !slices.Contains(retiredNames, m.primaryName) {
+				retiredNames = append(retiredNames, m.primaryName)
+			}
+		}
+	}
+
+	go func(oldContainers []string, activeCandidateID string, drainTime time.Duration) {
 		time.Sleep(drainTime)
-		drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		drainCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 
-		if prevID, _ := o.runner.FindContainerIDByName(drainCtx, oldContainerName); prevID != "" {
+		for _, oldName := range oldContainers {
+			if oldName == "" || oldName == candidateName {
+				continue
+			}
+			prevID, _ := o.runner.FindContainerIDByName(drainCtx, oldName)
+			if prevID == "" || prevID == activeCandidateID {
+				continue
+			}
 			_ = o.runner.StopContainer(drainCtx, prevID, 10)
-			o.logger.Info("Previous deployment slot stopped after drain period", "container", oldContainerName)
+			_ = o.runner.RemoveContainer(drainCtx, prevID)
+			o.logger.Info("Previous deployment slot stopped and retired after drain period", "container", oldName)
 		}
-	}(prevName, time.Duration(drainSec)*time.Second)
+	}(retiredNames, containerID, time.Duration(drainSec)*time.Second)
 
 	o.emitProgress(req, "completed", fmt.Sprintf("Deployment succeeded! Active slot is now %s (%s)", candidateSlot, candidateName), 100)
 
@@ -549,7 +601,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	}
 }
 
-// rolloutWorker starts the new companion worker container and replaces the previous instance
+// rolloutWorker starts the new companion worker container and replaces any previous canonical or legacy instance
 func (o *Orchestrator) rolloutWorker(
 	ctx context.Context,
 	image string,
@@ -557,42 +609,38 @@ func (o *Orchestrator) rolloutWorker(
 	worker WorkerSpec,
 	envVars []string,
 	networks []string,
+	baseServiceName string,
+	envName string,
+	secretFiles map[string]string,
 ) {
-	// 1. Remove previous stopped container or prepare graceful swap
-	staleID, _ := o.runner.FindContainerIDByName(ctx, containerName)
-	if staleID != "" {
-		_ = o.runner.StopContainer(ctx, staleID, 10)
-		_ = o.runner.RemoveContainer(ctx, staleID)
-	}
-
 	workerNets := worker.Networks
 	if len(workerNets) == 0 {
 		workerNets = networks
 	}
 
-	resolvedWorkerBinds := make([]string, 0, len(worker.Volumes))
-	for _, b := range worker.Volumes {
-		parts := strings.Split(b, ":")
-		if len(parts) > 0 {
-			if _, statErr := os.Stat(parts[0]); statErr == nil {
-				resolvedWorkerBinds = append(resolvedWorkerBinds, b)
+	// 1. Remove previous canonical worker container and any legacy pre-GitOps worker matching this role/env
+	staleID, _ := o.runner.FindContainerIDByName(ctx, containerName)
+	if staleID != "" {
+		_ = o.runner.StopContainer(ctx, staleID, 10)
+		_ = o.runner.RemoveContainer(ctx, staleID)
+	}
+	if allContainers, err := o.runner.ListAllContainers(ctx); err == nil {
+		for _, c := range allContainers {
+			if c.ID == staleID {
+				continue
+			}
+			if isLegacyCompanionWorkerContainer(c, worker.Name, envName, workerNets) {
+				o.logger.Info("Stopping and retiring legacy companion worker before starting replacement",
+					"legacy_worker", firstNonEmpty(c.Names),
+					"replacement", containerName,
+				)
+				_ = o.runner.StopContainer(ctx, c.ID, 10)
+				_ = o.runner.RemoveContainer(ctx, c.ID)
 			}
 		}
 	}
 
-	// Mount host feature flags directory read-only into worker container if present
-	if _, statErr := os.Stat("/etc/flarelens/flags"); statErr == nil {
-		hasFlagBind := false
-		for _, b := range resolvedWorkerBinds {
-			if strings.HasPrefix(b, "/etc/flarelens/flags") {
-				hasFlagBind = true
-				break
-			}
-		}
-		if !hasFlagBind {
-			resolvedWorkerBinds = append(resolvedWorkerBinds, "/etc/flarelens/flags:/etc/flarelens/flags:ro")
-		}
-	}
+	resolvedWorkerBinds := resolveVolumeBinds(worker.Volumes, envName, "worker", baseServiceName, secretFiles)
 
 	// 2. Create and start worker container
 	workerID, err := o.runner.CreateContainerWithOptions(ctx, ContainerConfig{
@@ -605,6 +653,7 @@ func (o *Orchestrator) rolloutWorker(
 		Networks:   workerNets,
 		Labels: map[string]string{
 			"flarelens.worker": worker.Name,
+			"flarelens.env":    envName,
 		},
 	})
 	if err != nil {
@@ -1105,4 +1154,420 @@ func parseEnvLines(content string) map[string]string {
 		}
 	}
 	return res
+}
+
+type matchedSlotContainer struct {
+	container   RunningContainerSummary
+	primaryName string
+	slot        Slot
+	isManaged   bool
+	isRunning   bool
+}
+
+func firstNonEmpty(items []string) string {
+	for _, s := range items {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func containerHasHostPort(c RunningContainerSummary, hostPort int) bool {
+	if hostPort <= 0 {
+		return false
+	}
+	for _, p := range c.Ports {
+		if p.PublicPort == hostPort {
+			return true
+		}
+	}
+	return false
+}
+
+func isHostPortBound(containers []RunningContainerSummary, hostPort int) bool {
+	if hostPort <= 0 {
+		return false
+	}
+	for _, c := range containers {
+		if strings.EqualFold(c.State, "running") && containerHasHostPort(c, hostPort) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHostPortBoundByUnrelatedRunning(
+	containers []RunningContainerSummary,
+	matched []matchedSlotContainer,
+	hostPort int,
+) bool {
+	if hostPort <= 0 {
+		return false
+	}
+	for _, c := range containers {
+		if !strings.EqualFold(c.State, "running") || !containerHasHostPort(c, hostPort) {
+			continue
+		}
+		isMatched := false
+		for _, m := range matched {
+			if m.container.ID == c.ID {
+				isMatched = true
+				break
+			}
+		}
+		if !isMatched {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRunningSlotContainerOnPort(matched []matchedSlotContainer, slot Slot, hostPort int) bool {
+	for _, m := range matched {
+		if m.isRunning && m.slot == slot && containerHasHostPort(m.container, hostPort) {
+			return true
+		}
+	}
+	return false
+}
+
+func identifyServiceSlotContainers(
+	containers []RunningContainerSummary,
+	serviceName string,
+	baseServiceName string,
+	envName string,
+	aliases []string,
+	targetNetworks []string,
+	workers []WorkerSpec,
+) []matchedSlotContainer {
+	normEnv := normalizeEnvShort(envName)
+	prefixes := dedupeNonEmptyStrings(append(
+		[]string{
+			serviceName,
+			baseServiceName,
+			fmt.Sprintf("%s-%s", baseServiceName, normEnv),
+		},
+		aliases...,
+	))
+
+	out := make([]matchedSlotContainer, 0)
+	for _, c := range containers {
+		primaryName := firstNonEmpty(c.Names)
+		lowerPrimary := strings.ToLower(primaryName)
+		if lowerPrimary == "" {
+			continue
+		}
+
+		// Skip preview containers, companion workers, and shared stateful/infra singletons
+		if strings.HasPrefix(strings.ToLower(c.Labels["flarelens.slot"]), "pr-") || strings.Contains(lowerPrimary, "-pr-") {
+			continue
+		}
+		if c.Labels["flarelens.worker"] != "" || c.Labels["flarelens.role"] == "singleton" {
+			continue
+		}
+		isWorker := false
+		for _, w := range workers {
+			wn := strings.ToLower(strings.TrimSpace(w.Name))
+			if wn != "" && (lowerPrimary == wn ||
+				lowerPrimary == fmt.Sprintf("%s-%s", wn, normEnv) ||
+				lowerPrimary == fmt.Sprintf("%s-%s", normEnv, wn) ||
+				strings.HasSuffix(lowerPrimary, "-"+wn)) {
+				isWorker = true
+				break
+			}
+		}
+		if isWorker {
+			continue
+		}
+		if strings.Contains(lowerPrimary, "postgres") ||
+			strings.Contains(lowerPrimary, "dragonfly") ||
+			strings.Contains(lowerPrimary, "redis") ||
+			strings.Contains(lowerPrimary, "traefik") ||
+			strings.Contains(lowerPrimary, "vector") ||
+			strings.Contains(lowerPrimary, "cloudflared") {
+			continue
+		}
+
+		if labelEnv := strings.TrimSpace(c.Labels["flarelens.env"]); labelEnv != "" &&
+			normalizeEnvShort(labelEnv) != normEnv {
+			continue
+		}
+
+		isRunning := strings.EqualFold(c.State, "running")
+
+		// 1. Explicit FlareLens-managed slot label match
+		if strings.EqualFold(strings.TrimSpace(c.Labels["flarelens.service"]), baseServiceName) {
+			slotVal := Slot(strings.ToLower(strings.TrimSpace(c.Labels["flarelens.slot"])))
+			if slotVal == SlotBlue || slotVal == SlotGreen {
+				out = append(out, matchedSlotContainer{
+					container:   c,
+					primaryName: primaryName,
+					slot:        slotVal,
+					isManaged:   true,
+					isRunning:   isRunning,
+				})
+				continue
+			}
+		}
+
+		// 2. Canonical or alias-prefixed slot container match (e.g. <alias>-green, <alias>-blue, or unslotted <alias>)
+		var matchedSlot Slot
+		matched := false
+		for _, n := range c.Names {
+			ln := strings.ToLower(strings.TrimSpace(n))
+			for _, p := range prefixes {
+				lp := strings.ToLower(strings.TrimSpace(p))
+				if lp == "" {
+					continue
+				}
+				switch {
+				case ln == lp+"-green":
+					matchedSlot = SlotGreen
+					matched = true
+				case ln == lp+"-blue":
+					matchedSlot = SlotBlue
+					matched = true
+				case ln == lp && sharesTargetNetwork(c.Networks, targetNetworks):
+					matchedSlot = SlotGreen
+					matched = true
+				}
+				if matched {
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		// Guard cross-environment matches on non-labeled containers using network overlap when available
+		if len(targetNetworks) > 0 && len(c.Networks) > 0 && !sharesTargetNetwork(c.Networks, targetNetworks) {
+			isCanonicalDirect := lowerPrimary == strings.ToLower(serviceName)+"-blue" ||
+				lowerPrimary == strings.ToLower(serviceName)+"-green"
+			if !isCanonicalDirect {
+				continue
+			}
+		}
+
+		out = append(out, matchedSlotContainer{
+			container:   c,
+			primaryName: primaryName,
+			slot:        matchedSlot,
+			isManaged:   false,
+			isRunning:   isRunning,
+		})
+	}
+	return out
+}
+
+func sharesTargetNetwork(containerNets map[string][]string, targetNetworks []string) bool {
+	for _, tn := range targetNetworks {
+		clean := strings.TrimSpace(tn)
+		if clean == "" || isSpecialDockerNetwork(clean) {
+			continue
+		}
+		if _, ok := containerNets[clean]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func detectActiveServiceSlot(
+	matched []matchedSlotContainer,
+	allContainers []RunningContainerSummary,
+	knownSlot Slot,
+	hasKnown bool,
+	portBlue int,
+	portGreen int,
+) Slot {
+	if hasKnown {
+		for _, m := range matched {
+			if m.isRunning && m.slot == knownSlot {
+				return knownSlot
+			}
+		}
+	}
+
+	// Prefer FlareLens-managed active slot when both managed and legacy containers exist
+	var managedBlue, managedGreen bool
+	for _, m := range matched {
+		if m.isRunning && m.isManaged {
+			if m.slot == SlotGreen {
+				managedGreen = true
+			} else if m.slot == SlotBlue {
+				managedBlue = true
+			}
+		}
+	}
+	if managedGreen {
+		return SlotGreen
+	}
+	if managedBlue {
+		return SlotBlue
+	}
+
+	// Next, inspect running legacy slot containers matching canonical/alias names
+	var legacyBlue, legacyGreen bool
+	for _, m := range matched {
+		if m.isRunning && !m.isManaged {
+			if m.slot == SlotGreen {
+				legacyGreen = true
+			} else if m.slot == SlotBlue {
+				legacyBlue = true
+			}
+		}
+	}
+	if legacyGreen && !legacyBlue {
+		return SlotGreen
+	}
+	if legacyBlue && !legacyGreen {
+		return SlotBlue
+	}
+	if legacyGreen {
+		return SlotGreen
+	}
+
+	// Fallback: inspect host port bindings so candidate never stages onto a bound slot port when the opposite port is free
+	greenBound := isHostPortBound(allContainers, portGreen)
+	blueBound := isHostPortBound(allContainers, portBlue)
+	if greenBound && !blueBound {
+		return SlotGreen
+	}
+	if blueBound && !greenBound {
+		return SlotBlue
+	}
+	if hasKnown {
+		return knownSlot
+	}
+	return SlotBlue
+}
+
+func isLegacyCompanionWorkerContainer(
+	c RunningContainerSummary,
+	workerName string,
+	envName string,
+	workerNetworks []string,
+) bool {
+	wn := strings.ToLower(strings.TrimSpace(workerName))
+	if wn == "" {
+		return false
+	}
+	normEnv := normalizeEnvShort(envName)
+	canonical := fmt.Sprintf("%s-%s", wn, normEnv)
+
+	if labelEnv := strings.TrimSpace(c.Labels["flarelens.env"]); labelEnv != "" &&
+		normalizeEnvShort(labelEnv) != normEnv {
+		return false
+	}
+
+	for _, n := range c.Names {
+		ln := strings.ToLower(strings.TrimSpace(n))
+		if ln == "" || ln == canonical {
+			continue
+		}
+		if ln == fmt.Sprintf("%s-%s", normEnv, wn) ||
+			strings.HasSuffix(ln, fmt.Sprintf("-%s-%s", normEnv, wn)) {
+			return true
+		}
+		if (ln == wn || strings.HasSuffix(ln, "-"+wn)) && sharesTargetNetwork(c.Networks, workerNetworks) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveVolumeBinds(
+	volumes []string,
+	envName string,
+	slotOrRole string,
+	baseServiceName string,
+	secretFiles map[string]string,
+) []string {
+	resolvedBinds := make([]string, 0, len(volumes)+2)
+	mountedDests := make(map[string]bool)
+
+	for _, b := range volumes {
+		formattedBind := b
+		if strings.Contains(formattedBind, "%s") {
+			formattedBind = fmt.Sprintf(formattedBind, envName, slotOrRole)
+		}
+		parts := strings.Split(formattedBind, ":")
+		if len(parts) > 0 {
+			if _, statErr := os.Stat(parts[0]); statErr == nil {
+				resolvedBinds = append(resolvedBinds, formattedBind)
+				if len(parts) > 1 {
+					mountedDests[strings.TrimSuffix(filepath.ToSlash(parts[1]), "/")] = true
+				}
+			}
+		}
+	}
+
+	if _, statErr := os.Stat("/etc/flarelens/flags"); statErr == nil {
+		if !mountedDests["/etc/flarelens/flags"] {
+			resolvedBinds = append(resolvedBinds, "/etc/flarelens/flags:/etc/flarelens/flags:ro")
+			mountedDests["/etc/flarelens/flags"] = true
+		}
+	}
+
+	if len(secretFiles) > 0 {
+		byDir := make(map[string]map[string]string)
+		for containerPath, content := range secretFiles {
+			clean := filepath.ToSlash(strings.TrimSpace(containerPath))
+			if !strings.HasPrefix(clean, "/") || content == "" {
+				continue
+			}
+			dir := strings.TrimSuffix(filepath.ToSlash(filepath.Dir(clean)), "/")
+			base := filepath.Base(clean)
+			if dir == "" || dir == "." || base == "" || base == "." || base == "/" {
+				continue
+			}
+			if mountedDests[dir] {
+				continue
+			}
+			if byDir[dir] == nil {
+				byDir[dir] = make(map[string]string)
+			}
+			byDir[dir][base] = content
+		}
+
+		for containerDir, files := range byDir {
+			hostBase := selectRAMSecretsBaseDir()
+			safeDirSlug := strings.ReplaceAll(strings.TrimPrefix(containerDir, "/"), "/", "_")
+			hostDir := filepath.Join(hostBase, fmt.Sprintf("%s-%s", baseServiceName, normalizeEnvShort(envName)), safeDirSlug)
+			if err := os.MkdirAll(hostDir, 0700); err != nil {
+				continue
+			}
+			wroteAll := true
+			for fileName, fileContent := range files {
+				targetFile := filepath.Join(hostDir, fileName)
+				if err := os.WriteFile(targetFile, []byte(fileContent), 0600); err != nil {
+					wroteAll = false
+					break
+				}
+			}
+			if wroteAll {
+				resolvedBinds = append(resolvedBinds, fmt.Sprintf("%s:%s:ro", hostDir, containerDir))
+				mountedDests[containerDir] = true
+			}
+		}
+	}
+
+	return resolvedBinds
+}
+
+func selectRAMSecretsBaseDir() string {
+	for _, candidate := range []string{"/run/shm", "/dev/shm", "/run"} {
+		if isExistingDir(candidate) {
+			dir := filepath.Join(candidate, "flarelens-secrets")
+			if err := os.MkdirAll(dir, 0700); err == nil {
+				return dir
+			}
+		}
+	}
+	return filepath.Join(os.TempDir(), "flarelens-secrets")
 }

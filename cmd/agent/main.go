@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.2"
+	Version = "0.2.3"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -403,7 +403,11 @@ func main() {
 	// 4. Initialize Blue/Green deployment engine
 	dockerRunner := deploy.NewDockerRunner(cfg.Docker.Socket)
 	healthProber := deploy.NewHealthProber()
-	traefikFlipper := deploy.NewTraefikRouteFlipper("")
+	discoveredTraefikDir := dockerRunner.DiscoverTraefikRoutesDir(ctx)
+	if discoveredTraefikDir != "" {
+		logger.Info("Discovered Traefik dynamic routes directory from running container mounts", "dir", discoveredTraefikDir)
+	}
+	traefikFlipper := deploy.NewTraefikRouteFlipper(discoveredTraefikDir)
 
 	// 5. Connect to NATS Event Fabric (Embedded or Client mode)
 	natsClient := transport.NewNATSClient(cfg.NATS.URL, cfg.NATS.AuthToken, logger)

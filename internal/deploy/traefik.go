@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // TraefikRouteFlipper updates Traefik's dynamic file provider routing atomically
@@ -34,33 +35,53 @@ func NewTraefikRouteFlipper(dynamicDir string) *TraefikRouteFlipper {
 	}
 }
 
+var traefikUpstreamURLRe = regexp.MustCompile(`url:\s*["']?http://[^:\s'"]+:\d+["']?`)
+
 // SwitchRoute atomically points Traefik to the candidate container/port, updating existing route files or creating a new route
-func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, targetPort int, domain string) error {
+func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, targetPort int, domain string, aliases ...string) error {
 	if err := os.MkdirAll(t.dynamicDir, 0755); err != nil {
 		return fmt.Errorf("failed to create traefik dynamic config directory: %w", err)
 	}
 
 	targetURL := fmt.Sprintf("http://%s:%d", targetHost, targetPort)
 
-	// Check if existing route file exists (e.g. uat-orders-api.yml, prod-orders-api.yml, etc.)
-	candidates := []string{
-		filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yml", stack, service)),
-		filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yaml", stack, service)),
-		filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yml", service)),
-		filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", service)),
+	names := dedupeNonEmptyStrings(append([]string{service}, aliases...))
+	candidates := make([]string, 0, len(names)*4)
+	for _, name := range names {
+		candidates = append(candidates,
+			filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yml", stack, name)),
+			filepath.Join(t.dynamicDir, fmt.Sprintf("%s-%s.yaml", stack, name)),
+			filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yml", name)),
+			filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", name)),
+		)
 	}
 
 	for _, p := range candidates {
-		data, err := os.ReadFile(p)
-		if err == nil {
-			content := string(data)
-			re := regexp.MustCompile(`url:\s*["']?http://[^:\s'"]+:\d+["']?`)
-			if re.MatchString(content) {
-				updated := re.ReplaceAllString(content, fmt.Sprintf("url: %s", targetURL))
-				tmpPath := p + ".tmp"
-				if err := os.WriteFile(tmpPath, []byte(updated), 0644); err == nil {
-					_ = os.Rename(tmpPath, p)
-					return nil
+		if updated, err := updateTraefikRouteFileURL(p, targetURL); err == nil && updated {
+			return nil
+		}
+	}
+
+	// Fallback: scan existing dynamic route files for matching Host(`domain`) rule
+	if domain != "" {
+		if entries, err := os.ReadDir(t.dynamicDir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+					continue
+				}
+				fullPath := filepath.Join(t.dynamicDir, name)
+				data, err := os.ReadFile(fullPath)
+				if err != nil {
+					continue
+				}
+				if strings.Contains(string(data), domain) {
+					if updated, err := updateTraefikRouteFileURL(fullPath, targetURL); err == nil && updated {
+						return nil
+					}
 				}
 			}
 		}
@@ -76,6 +97,59 @@ func (t *TraefikRouteFlipper) SwitchRoute(stack, service, targetHost string, tar
 	return t.FlipRoute(fmt.Sprintf("%s-%s", stack, service), domain, targetPort)
 }
 
+func updateTraefikRouteFileURL(path, targetURL string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	content := string(data)
+	if !traefikUpstreamURLRe.MatchString(content) {
+		return false, nil
+	}
+	updated := traefikUpstreamURLRe.ReplaceAllString(content, fmt.Sprintf("url: %s", targetURL))
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(updated), 0644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, err
+	}
+	return true, nil
+}
+
+func (t *TraefikRouteFlipper) detectDefaultEntryPoint() string {
+	entries, err := os.ReadDir(t.dynamicDir)
+	if err != nil {
+		return "websecure"
+	}
+	sawWeb := false
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(t.dynamicDir, name))
+		if err != nil {
+			continue
+		}
+		text := string(data)
+		if strings.Contains(text, "websecure") {
+			return "websecure"
+		}
+		if strings.Contains(text, "- web") || strings.Contains(text, `- "web"`) {
+			sawWeb = true
+		}
+	}
+	if sawWeb {
+		return "web"
+	}
+	return "websecure"
+}
+
 // FlipRoute atomically points Traefik domain traffic to the target host port on loopback
 func (t *TraefikRouteFlipper) FlipRoute(service, domain string, targetPort int) error {
 	return t.flipRouteURL(service, domain, fmt.Sprintf("http://127.0.0.1:%d", targetPort))
@@ -89,19 +163,21 @@ func (t *TraefikRouteFlipper) flipRouteURL(service, domain, upstreamURL string) 
 		return fmt.Errorf("failed to create traefik dynamic config directory: %w", err)
 	}
 
+	entryPoint := t.detectDefaultEntryPoint()
+
 	content := fmt.Sprintf(`http:
   routers:
     %s-router:
       rule: "Host(%s)"
       service: "%s-svc"
       entryPoints:
-        - "websecure"
+        - %q
   services:
     %s-svc:
       loadBalancer:
         servers:
           - url: %q
-`, service, fmt.Sprintf("`%s`", domain), service, service, upstreamURL)
+`, service, fmt.Sprintf("`%s`", domain), service, entryPoint, service, upstreamURL)
 
 	finalPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml", service))
 	tmpPath := filepath.Join(t.dynamicDir, fmt.Sprintf("%s.yaml.tmp", service))

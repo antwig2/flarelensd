@@ -217,11 +217,29 @@ type ContainerDetail struct {
 	Networks map[string][]string
 }
 
-// RunningContainerSummary holds network attachment metadata for an active container
+// PublishedPort describes an active host-to-container port binding reported by Docker Engine
+type PublishedPort struct {
+	IP          string
+	PrivatePort int
+	PublicPort  int
+	Type        string
+}
+
+// ContainerMount describes a host bind mount reported by Docker Engine
+type ContainerMount struct {
+	Source      string
+	Destination string
+}
+
+// RunningContainerSummary holds network, port, mount, and label metadata for a Docker container
 type RunningContainerSummary struct {
 	ID       string
 	Names    []string
+	Image    string
+	State    string
 	Labels   map[string]string
+	Ports    []PublishedPort
+	Mounts   []ContainerMount
 	Networks map[string][]string // networkName -> aliases
 }
 
@@ -849,12 +867,25 @@ func (r *DockerRunner) InspectContainerNetworks(ctx context.Context, containerID
 	return res, nil
 }
 
-// ListRunningContainers returns network and label summaries for running containers on the host
+// ListRunningContainers returns network, port, mount, and label summaries for running containers on the host
 func (r *DockerRunner) ListRunningContainers(ctx context.Context) ([]RunningContainerSummary, error) {
+	return r.listContainers(ctx, false)
+}
+
+// ListAllContainers returns network, port, mount, and label summaries for all containers (running and stopped) on the host
+func (r *DockerRunner) ListAllContainers(ctx context.Context) ([]RunningContainerSummary, error) {
+	return r.listContainers(ctx, true)
+}
+
+func (r *DockerRunner) listContainers(ctx context.Context, includeStopped bool) ([]RunningContainerSummary, error) {
 	if strings.HasPrefix(r.socket, "mock") {
 		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/containers/json", nil)
+	endpoint := "http://localhost/containers/json"
+	if includeStopped {
+		endpoint += "?all=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -870,9 +901,21 @@ func (r *DockerRunner) ListRunningContainers(ctx context.Context) ([]RunningCont
 	}
 
 	var raw []struct {
-		ID              string            `json:"Id"`
-		Names           []string          `json:"Names"`
-		Labels          map[string]string `json:"Labels"`
+		ID     string            `json:"Id"`
+		Names  []string          `json:"Names"`
+		Image  string            `json:"Image"`
+		State  string            `json:"State"`
+		Labels map[string]string `json:"Labels"`
+		Ports  []struct {
+			IP          string `json:"IP"`
+			PrivatePort int    `json:"PrivatePort"`
+			PublicPort  int    `json:"PublicPort"`
+			Type        string `json:"Type"`
+		} `json:"Ports"`
+		Mounts []struct {
+			Source      string `json:"Source"`
+			Destination string `json:"Destination"`
+		} `json:"Mounts"`
 		NetworkSettings struct {
 			Networks map[string]struct {
 				Aliases []string `json:"Aliases"`
@@ -893,14 +936,93 @@ func (r *DockerRunner) ListRunningContainers(ctx context.Context) ([]RunningCont
 		for _, n := range item.Names {
 			names = append(names, strings.TrimPrefix(n, "/"))
 		}
+		ports := make([]PublishedPort, 0, len(item.Ports))
+		for _, p := range item.Ports {
+			ports = append(ports, PublishedPort{
+				IP:          p.IP,
+				PrivatePort: p.PrivatePort,
+				PublicPort:  p.PublicPort,
+				Type:        p.Type,
+			})
+		}
+		mounts := make([]ContainerMount, 0, len(item.Mounts))
+		for _, m := range item.Mounts {
+			if m.Source != "" || m.Destination != "" {
+				mounts = append(mounts, ContainerMount{
+					Source:      m.Source,
+					Destination: m.Destination,
+				})
+			}
+		}
 		out = append(out, RunningContainerSummary{
 			ID:       item.ID,
 			Names:    names,
+			Image:    item.Image,
+			State:    item.State,
 			Labels:   item.Labels,
+			Ports:    ports,
+			Mounts:   mounts,
 			Networks: nets,
 		})
 	}
 	return out, nil
+}
+
+// DiscoverTraefikRoutesDir inspects running Traefik containers via Docker Engine mounts
+// to locate the active dynamic file-provider directory on the host without hardcoded vendor paths.
+func (r *DockerRunner) DiscoverTraefikRoutesDir(ctx context.Context) string {
+	containers, err := r.ListRunningContainers(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, c := range containers {
+		isTraefik := strings.Contains(strings.ToLower(c.Image), "traefik")
+		if !isTraefik {
+			for _, n := range c.Names {
+				if strings.Contains(strings.ToLower(n), "traefik") {
+					isTraefik = true
+					break
+				}
+			}
+		}
+		if !isTraefik {
+			continue
+		}
+
+		// 1. Direct mount targeting a dynamic or routes directory inside Traefik
+		for _, m := range c.Mounts {
+			dest := strings.ToLower(filepath.ToSlash(m.Destination))
+			if (strings.Contains(dest, "routes") || strings.Contains(dest, "dynamic")) && isExistingDir(m.Source) {
+				return m.Source
+			}
+		}
+
+		// 2. Mount targeting /etc/traefik root directory — check standard route subdirectories on host
+		for _, m := range c.Mounts {
+			dest := strings.TrimSuffix(filepath.ToSlash(m.Destination), "/")
+			if dest == "/etc/traefik" && isExistingDir(m.Source) {
+				subCandidates := []string{
+					filepath.Join(m.Source, "routes"),
+					filepath.Join(m.Source, "dynamic", "routes"),
+					filepath.Join(m.Source, "dynamic"),
+				}
+				for _, sub := range subCandidates {
+					if isExistingDir(sub) {
+						return sub
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func isExistingDir(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func dedupeNonEmptyStrings(items []string) []string {

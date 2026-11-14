@@ -21,13 +21,14 @@ func NewMigrationRunner(logger *slog.Logger) *MigrationRunner {
 	return &MigrationRunner{logger: logger}
 }
 
-// Run executes a database migration command inside an ephemeral container with in-memory secrets
+// Run executes a database migration command inside an ephemeral container with in-memory secrets and optional read-only volume binds
 func (m *MigrationRunner) Run(
 	ctx context.Context,
 	image string,
 	command string,
 	envVars []string,
 	network string,
+	binds ...string,
 ) (string, error) {
 	if command == "" {
 		command = "migrate up"
@@ -36,6 +37,12 @@ func (m *MigrationRunner) Run(
 	cmdArgs := []string{"run", "--rm"}
 	if network != "" {
 		cmdArgs = append(cmdArgs, "--network", network)
+	}
+
+	for _, b := range binds {
+		if strings.TrimSpace(b) != "" {
+			cmdArgs = append(cmdArgs, "-v", b)
+		}
 	}
 
 	// Inject in-memory environment secrets
