@@ -50,6 +50,7 @@ It unifies 4 major systems that previously required 4 separate tools:
 
 #### 3. GitOps & Zero-Downtime Deployments (Replaces Portainer / Jenkins / ArgoCD)
 - **Atomic Blue/Green Rollouts & Multi-Replica Traefik LB**: Deploys the new container (Green), verifies its health on localhost, merges remote WireGuard replica upstreams with health checks, and performs an atomic inotify swap on Traefik routing in **< 1 millisecond** (zero dropped TCP connections).
+- **Hard Kernel Cgroup RAM/CPU Isolation & Auto Image Prune**: Enforces `memory_mb` (`HostConfig.Memory`) and `cpu_cores` (`HostConfig.NanoCPUs`) across Blue/Green candidates, companion workers, and singletons (including zero-restart live `POST /containers/{id}/update` cgroup adjustments on running stateful databases), plus automatic debounced Docker image garbage collection (`POST /images/prune` retaining 72h of recent rollback images while reclaiming retired layers).
 - **Safe Node Drain & Stateful Volume Fencing**: Executes `decommission_service` during node cordoning/draining while refusing to wipe stateful database containers unless explicitly forced.
 - **Isolated Migration Runner**: Executes database schema migrations in an ephemeral container with auto-rollback before live traffic hits the new app version.
 

@@ -58,11 +58,14 @@ type Orchestrator struct {
 	meshDNSFn         func(env string) ([]string, []string)
 	meshDNSSeedFn     func(env string, extraHosts []string)
 
-	mu          sync.RWMutex
-	activeSlots map[string]Slot
-	activePorts map[string]int
-	nodeID      string
-	activeOps   atomic.Int32
+	mu                 sync.RWMutex
+	activeSlots        map[string]Slot
+	activePorts        map[string]int
+	nodeID             string
+	activeOps          atomic.Int32
+	lastImagePruneNano atomic.Int64
+	pruneCooldown      time.Duration
+	pruneRetention     time.Duration
 }
 
 // BeginOp increments the active orchestration operation counter (used by OTA drain lock).
@@ -92,15 +95,74 @@ func NewOrchestrator(
 		logger = slog.Default()
 	}
 	return &Orchestrator{
-		runner:      runner,
-		prober:      prober,
-		traefik:     traefik,
-		natsClient:  natsClient,
-		logger:      logger,
-		activeSlots: make(map[string]Slot),
-		activePorts: make(map[string]int),
-		nodeID:      nodeID,
-		migrator:    NewMigrationRunner(logger),
+		runner:         runner,
+		prober:         prober,
+		traefik:        traefik,
+		natsClient:     natsClient,
+		logger:         logger,
+		activeSlots:    make(map[string]Slot),
+		activePorts:    make(map[string]int),
+		nodeID:         nodeID,
+		migrator:       NewMigrationRunner(logger),
+		pruneCooldown:  6 * time.Hour,
+		pruneRetention: 72 * time.Hour,
+	}
+}
+
+// SetImagePrunePolicy configures minimum interval between automatic post-deploy prunes and image retention window.
+func (o *Orchestrator) SetImagePrunePolicy(cooldown, retention time.Duration) {
+	o.mu.Lock()
+	o.pruneCooldown = cooldown
+	o.pruneRetention = retention
+	o.mu.Unlock()
+}
+
+// PruneUnusedImages runs immediate Docker image garbage collection for unreferenced images older than retention.
+func (o *Orchestrator) PruneUnusedImages(ctx context.Context, retention time.Duration) (ImagePruneReport, error) {
+	if o.runner == nil {
+		return ImagePruneReport{}, nil
+	}
+	if retention <= 0 {
+		o.mu.RLock()
+		retention = o.pruneRetention
+		o.mu.RUnlock()
+	}
+	rep, err := o.runner.PruneUnusedImages(ctx, retention)
+	if err == nil {
+		o.lastImagePruneNano.Store(time.Now().UnixNano())
+		if rep.ImagesDeleted > 0 || rep.SpaceReclaimed > 0 {
+			o.logger.Info("Pruned retired unused Docker images",
+				"images_deleted", rep.ImagesDeleted,
+				"reclaimed_mb", rep.SpaceReclaimed/(1024*1024),
+			)
+		}
+	}
+	return rep, err
+}
+
+// MaybeAutoPruneImages triggers debounced Docker image garbage collection when no deployment is in-flight.
+func (o *Orchestrator) MaybeAutoPruneImages(ctx context.Context) {
+	if o.runner == nil || o.ActiveOps() > 0 {
+		return
+	}
+	o.mu.RLock()
+	cooldown := o.pruneCooldown
+	retention := o.pruneRetention
+	o.mu.RUnlock()
+
+	now := time.Now().UnixNano()
+	last := o.lastImagePruneNano.Load()
+	if cooldown > 0 && last > 0 && time.Duration(now-last) < cooldown {
+		return
+	}
+	if !o.lastImagePruneNano.CompareAndSwap(last, now) {
+		return
+	}
+
+	pruneCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if _, err := o.PruneUnusedImages(pruneCtx, retention); err != nil {
+		o.logger.Debug("Automatic Docker image prune warning", "error", err)
 	}
 }
 
@@ -497,6 +559,8 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		ExtraHosts:    mergedExtraHosts,
 		DNS:           dnsServers,
 		DNSSearch:     dnsSearch,
+		MemoryMB:      req.MemoryMB,
+		CPUCores:      req.CPUCores,
 		HostPort:      candidatePort,
 		ContainerPort: profile.ContainerPort,
 		Networks:      profile.Networks,
@@ -663,7 +727,10 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	for _, worker := range profile.Workers {
 		workerName := fmt.Sprintf("%s-%s", worker.Name, envName)
 		o.emitProgress(req, "worker", fmt.Sprintf("Rolling out companion worker: %s", workerName), 92)
-		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles, mergedExtraHosts, dnsServers, dnsSearch)
+		effectiveWorker := worker
+		effectiveWorker.MemoryMB = cmp.Or(worker.MemoryMB, req.MemoryMB)
+		effectiveWorker.CPUCores = cmp.Or(worker.CPUCores, req.CPUCores)
+		o.rolloutWorker(ctx, req.Image, workerName, effectiveWorker, envList, profile.Networks, baseServiceName, envName, secretFiles, mergedExtraHosts, dnsServers, dnsSearch)
 	}
 
 	// 12. Drain, stop, and remove previous web slot(s) (both canonical and legacy pre-GitOps slots)
@@ -696,6 +763,9 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 			_ = o.runner.RemoveContainer(drainCtx, prevID)
 			o.logger.Info("Previous deployment slot stopped and retired after drain period", "container", oldName)
 		}
+
+		// Reclaim NVMe disk space from retired Blue/Green images older than retention window (debounced)
+		o.MaybeAutoPruneImages(context.Background())
 	}(retiredNames, containerID, time.Duration(drainSec)*time.Second)
 
 	o.emitProgress(req, "completed", fmt.Sprintf("Deployment succeeded! Active slot is now %s (%s)", candidateSlot, candidateName), 100)
@@ -766,6 +836,8 @@ func (o *Orchestrator) rolloutWorker(
 		ExtraHosts: extraHosts,
 		DNS:        dnsServers,
 		DNSSearch:  dnsSearch,
+		MemoryMB:   worker.MemoryMB,
+		CPUCores:   worker.CPUCores,
 		Networks:   workerNets,
 		Labels: map[string]string{
 			"flarelens.worker":  worker.Name,

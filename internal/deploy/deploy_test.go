@@ -1469,3 +1469,180 @@ func TestMeshDNSHookPromotesExtraHostsToDynamicDNSWithFallback(t *testing.T) {
 		t.Fatalf("expected ExtraHosts fallback to retain workflow:100.64.0.2, got %v", fallbackCfg.HostConfig.ExtraHosts)
 	}
 }
+
+func TestContainerCgroupResourceLimitsLiveUpdateAndAutoImagePrune(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "fl-res-")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "d.sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	created := make(map[string]containerCreateConfig)
+	running := make(map[string]bool)
+	updatedLimits := make(map[string]struct {
+		Memory   int64 `json:"Memory"`
+		NanoCPUs int64 `json:"NanoCPUs"`
+	})
+	var pruneFilters []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/images/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"pulled"}`))
+	})
+	mux.HandleFunc("/images/prune", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		pruneFilters = append(pruneFilters, r.URL.Query().Get("filters"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ImagesDeleted":[{"Deleted":"sha256:old1"}],"SpaceReclaimed":104857600}`))
+	})
+	mux.HandleFunc("/networks/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		var cfg containerCreateConfig
+		_ = json.NewDecoder(r.Body).Decode(&cfg)
+		mu.Lock()
+		created[name] = cfg
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"id-` + name + `"}`))
+	})
+	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/containers/")
+		if strings.HasSuffix(path, "/start") {
+			id := strings.TrimSuffix(path, "/start")
+			mu.Lock()
+			running[id] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if strings.HasSuffix(path, "/update") {
+			id := strings.TrimSuffix(path, "/update")
+			var body struct {
+				Memory   int64 `json:"Memory"`
+				NanoCPUs int64 `json:"NanoCPUs"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			updatedLimits[id] = body
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Warnings":[]}`))
+			return
+		}
+		if strings.HasSuffix(path, "/json") {
+			name := strings.TrimSuffix(path, "/json")
+			mu.Lock()
+			cfg, ok := created[name]
+			isRun := running["id-"+name]
+			mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Id":    "id-" + name,
+				"State": map[string]any{"Running": isRun},
+				"Config": map[string]any{
+					"Image":  cfg.Image,
+					"Labels": cfg.Labels,
+				},
+				"NetworkSettings": map[string]any{"Networks": map[string]any{}},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	runner := NewDockerRunner("unix://" + sockPath)
+	orch := NewOrchestrator(runner, NewHealthProber(), NewTraefikRouteFlipper(t.TempDir()), nil, "node-1", nil)
+
+	// 1. New container gets hard Memory (512 MiB) & NanoCPUs (1.5 cores) cgroup limits
+	resp1 := orch.ReconcileSingleton(t.Context(), SingletonSpec{
+		DeploymentID:  "cg-pg-1",
+		Service:       "postgres",
+		Env:           "uat",
+		Image:         "postgres:18-alpine",
+		ContainerName: "uat-postgres",
+		Networks:      []string{"app-uat"},
+		MemoryMB:      512,
+		CPUCores:      1.5,
+	})
+	if resp1.Status != "success" {
+		t.Fatalf("create postgres singleton failed: %s", resp1.Message)
+	}
+
+	mu.Lock()
+	pgCfg := created["uat-postgres"]
+	mu.Unlock()
+
+	const want512MiB = int64(512) * 1024 * 1024
+	const want15Cores = int64(1_500_000_000)
+	if pgCfg.HostConfig.Memory != want512MiB {
+		t.Fatalf("want HostConfig.Memory=%d, got %d", want512MiB, pgCfg.HostConfig.Memory)
+	}
+	if pgCfg.HostConfig.NanoCPUs != want15Cores {
+		t.Fatalf("want HostConfig.NanoCPUs=%d, got %d", want15Cores, pgCfg.HostConfig.NanoCPUs)
+	}
+
+	// 2. Reconciling an already-running stateful singleton updates cgroup limits IN PLACE (zero restart)
+	resp2 := orch.ReconcileSingleton(t.Context(), SingletonSpec{
+		DeploymentID:  "cg-pg-2",
+		Service:       "postgres",
+		Env:           "uat",
+		Image:         "postgres:18-alpine",
+		ContainerName: "uat-postgres",
+		Networks:      []string{"app-uat"},
+		MemoryMB:      1024,
+		CPUCores:      2.0,
+	})
+	if resp2.Status != "success" {
+		t.Fatalf("live-update postgres singleton failed: %s", resp2.Message)
+	}
+
+	mu.Lock()
+	liveUpd, didLiveUpdate := updatedLimits["id-uat-postgres"]
+	mu.Unlock()
+	if !didLiveUpdate {
+		t.Fatalf("expected live /containers/id-uat-postgres/update call without restarting postgres")
+	}
+	if liveUpd.Memory != int64(1024)*1024*1024 || liveUpd.NanoCPUs != 2_000_000_000 {
+		t.Fatalf("unexpected live resource update payload: %+v", liveUpd)
+	}
+
+	// 3. Auto Image Prune executes 2 passes (dangling 24h + unused tagged 72h) and respects cooldown debounce
+	orch.SetImagePrunePolicy(time.Hour, 72*time.Hour)
+	orch.MaybeAutoPruneImages(t.Context())
+	orch.MaybeAutoPruneImages(t.Context()) // second call inside 1h cooldown must be skipped
+
+	mu.Lock()
+	gotFilters := slices.Clone(pruneFilters)
+	mu.Unlock()
+
+	if len(gotFilters) != 2 {
+		t.Fatalf("expected exactly 2 prune API passes (debounced), got %d: %v", len(gotFilters), gotFilters)
+	}
+	if !strings.Contains(gotFilters[0], `"dangling":["true"]`) || !strings.Contains(gotFilters[0], `"24h"`) {
+		t.Fatalf("unexpected pass 1 dangling prune filter: %s", gotFilters[0])
+	}
+	if !strings.Contains(gotFilters[1], `"dangling":["false"]`) || !strings.Contains(gotFilters[1], `"72h"`) {
+		t.Fatalf("unexpected pass 2 unused image prune filter: %s", gotFilters[1])
+	}
+}

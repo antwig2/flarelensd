@@ -39,6 +39,8 @@ type SingletonSpec struct {
 	Healthcheck           *HealthcheckSpec  `json:"healthcheck,omitempty"`
 	Secrets               map[string]string `json:"secrets,omitempty"`
 	ExtraHosts            []string          `json:"extra_hosts,omitempty"`
+	MemoryMB              int               `json:"memory_mb,omitzero"`
+	CPUCores              float64           `json:"cpu_cores,omitzero"`
 	ForceRecreateStateful bool              `json:"force_recreate_stateful,omitempty"`
 }
 
@@ -95,7 +97,7 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 	statefulProtected := isStatefulProtected(service, containerName)
 
 	if existing != nil && existing.Running {
-		// Always heal missing networks and DNS aliases live with zero container restart.
+		// Always heal missing networks, DNS aliases, and cgroup RAM/CPU limits live with zero container restart.
 		if err := o.runner.PromoteNetworkAliases(ctx, existing.ID, networks, aliases); err != nil {
 			o.logger.Warn("Failed to heal singleton network aliases",
 				"container", containerName,
@@ -103,6 +105,16 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 				"aliases", aliases,
 				"error", err,
 			)
+		}
+		if spec.MemoryMB >= 6 || spec.CPUCores > 0 {
+			if err := o.runner.UpdateContainerResources(ctx, existing.ID, spec.MemoryMB, spec.CPUCores); err != nil {
+				o.logger.Warn("Failed to live-update singleton cgroup limits",
+					"container", containerName,
+					"memory_mb", spec.MemoryMB,
+					"cpu_cores", spec.CPUCores,
+					"error", err,
+				)
+			}
 		}
 
 		existingHash := strings.TrimSpace(existing.Labels["flarelens.spec_hash"])
@@ -224,6 +236,8 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		ExtraHosts:    mergedExtraHosts,
 		DNS:           dnsServers,
 		DNSSearch:     dnsSearch,
+		MemoryMB:      spec.MemoryMB,
+		CPUCores:      spec.CPUCores,
 		PortMappings:  spec.Ports,
 		RestartPolicy: cmp.Or(strings.TrimSpace(spec.Restart), "always"),
 		Healthcheck:   toContainerHealthcheck(spec.Healthcheck),

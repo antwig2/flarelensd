@@ -9,6 +9,8 @@ type WorkerSpec struct {
 	Entrypoint []string `json:"entrypoint,omitempty"` // e.g. ["/app", "worker", "start"]
 	Volumes    []string `json:"volumes,omitempty"`    // host:container bind mounts
 	Networks   []string `json:"networks,omitempty"`   // additional docker networks
+	MemoryMB   int      `json:"memory_mb,omitzero"`   // optional worker RAM limit override (MB)
+	CPUCores   float64  `json:"cpu_cores,omitzero"`   // optional worker CPU limit override (cores, e.g. 0.5)
 }
 
 // DeployRequest defines a declarative deployment trigger
@@ -43,6 +45,8 @@ type DeployRequest struct {
 	IsPreview         bool              `json:"is_preview"`
 	PRNumber          int               `json:"pr_number"`
 	MeshPort          int               `json:"mesh_port,omitzero"`
+	MemoryMB          int               `json:"memory_mb,omitzero"`
+	CPUCores          float64           `json:"cpu_cores,omitzero"`
 	ExtraHosts        []string          `json:"extra_hosts,omitempty"`
 	RemoteUpstreams   []string          `json:"remote_upstreams,omitempty"`
 }

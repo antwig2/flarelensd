@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.7"
+	Version = "0.2.8"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -632,6 +632,9 @@ func main() {
 	// 6c. Launch local zero-latency Feature Flags edge daemon (HTTP on 0.0.0.0:8999 for containers)
 	go startLocalFlagsServer(ctx, flagStore, logger)
 
+	// 6d. Periodic Docker image garbage collection for retired Blue/Green tags (every 12h when idle)
+	go startAutoImagePruneLoop(ctx, deployOrchestrator, logger)
+
 	// 7. Handle OS Signals (Graceful shutdown & SIGHUP hot reload on Unix)
 	waitForShutdown(cancel, logger, func() {
 		if reloaded, err := config.Load(os.Args[1:]); err == nil {
@@ -1129,6 +1132,9 @@ type NodeCommand struct {
 	Units                 []string                `json:"units,omitempty"`
 	Reason                string                  `json:"reason,omitempty"`
 	MeshPort              int                     `json:"mesh_port,omitzero"`
+	MemoryMB              int                     `json:"memory_mb,omitzero"`
+	CPUCores              float64                 `json:"cpu_cores,omitzero"`
+	UntilHours            int                     `json:"until_hours,omitzero"`
 	DrainSeconds          int                     `json:"drain_seconds,omitzero"`
 	ExtraHosts            []string                `json:"extra_hosts,omitempty"`
 	RemoteUpstreams       []string                `json:"remote_upstreams,omitempty"`
@@ -1374,6 +1380,8 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						IsPreview:         c.IsPreview,
 						PRNumber:          c.PRNumber,
 						MeshPort:          c.MeshPort,
+						MemoryMB:          c.MemoryMB,
+						CPUCores:          c.CPUCores,
 						ExtraHosts:        c.ExtraHosts,
 						RemoteUpstreams:   c.RemoteUpstreams,
 					}
@@ -1483,6 +1491,8 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 					Healthcheck:           c.Healthcheck,
 					Secrets:               c.Secrets,
 					ExtraHosts:            c.ExtraHosts,
+					MemoryMB:              c.MemoryMB,
+					CPUCores:              c.CPUCores,
 					ForceRecreateStateful: c.ForceRecreateStateful,
 				})
 				if cfg.ControlPlane.Endpoint != "" {
@@ -1528,6 +1538,26 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						PRNumber: c.PRNumber,
 					}
 					_ = orchestrator.TeardownPreview(context.Background(), tdReq)
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+		case "prune_images":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator != nil {
+					retention := time.Duration(cmp.Or(c.UntilHours, 72)) * time.Hour
+					pruneCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					rep, err := orchestrator.PruneUnusedImages(pruneCtx, retention)
+					cancel()
+					if err != nil {
+						logger.Warn("On-demand Docker image prune failed", "id", c.ID, "error", err)
+					} else {
+						logger.Info("On-demand Docker image prune completed",
+							"id", c.ID,
+							"images_deleted", rep.ImagesDeleted,
+							"space_reclaimed_bytes", rep.SpaceReclaimed,
+						)
+					}
 				}
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
@@ -1881,4 +1911,21 @@ func startLocalFlagsServer(ctx context.Context, store *flags.Store, logger *slog
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
+}
+
+func startAutoImagePruneLoop(ctx context.Context, orchestrator *deploy.Orchestrator, logger *slog.Logger) {
+	if orchestrator == nil {
+		return
+	}
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			orchestrator.MaybeAutoPruneImages(ctx)
+		}
+	}
 }

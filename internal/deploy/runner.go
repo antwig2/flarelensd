@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -50,11 +51,13 @@ func (r *DockerRunner) PullImage(ctx context.Context, image string) error {
 		return nil
 	}
 
-	// 1. Try host docker CLI first if available (supports credentials seamlessly like Kamal)
-	if dockerBin, err := exec.LookPath("docker"); err == nil && dockerBin != "" {
-		cmd := exec.CommandContext(ctx, dockerBin, "pull", image)
-		if _, err := cmd.CombinedOutput(); err == nil {
-			return nil
+	// 1. Try host docker CLI first when targeting default host socket (supports registry credentials seamlessly)
+	if r.socket == "/var/run/docker.sock" {
+		if dockerBin, err := exec.LookPath("docker"); err == nil && dockerBin != "" {
+			cmd := exec.CommandContext(ctx, dockerBin, "pull", image)
+			if _, err := cmd.CombinedOutput(); err == nil {
+				return nil
+			}
 		}
 	}
 
@@ -162,6 +165,8 @@ type containerHostConfig struct {
 	ExtraHosts    []string                      `json:"ExtraHosts,omitempty"`
 	DNS           []string                      `json:"Dns,omitempty"`
 	DNSSearch     []string                      `json:"DnsSearch,omitempty"`
+	Memory        int64                         `json:"Memory,omitzero"`
+	NanoCPUs      int64                         `json:"NanoCPUs,omitzero"`
 	PortBindings  map[string][]portBindingEntry `json:"PortBindings,omitempty"`
 	NetworkMode   string                        `json:"NetworkMode,omitempty"`
 	OomScoreAdj   int                           `json:"OomScoreAdj"`
@@ -202,6 +207,8 @@ type ContainerConfig struct {
 	ExtraHosts    []string
 	DNS           []string
 	DNSSearch     []string
+	MemoryMB      int
+	CPUCores      float64
 	HostPort      int
 	ContainerPort int
 	PortMappings  []string
@@ -437,6 +444,8 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 		extraHosts = dedupeNonEmptyStrings(cfg.ExtraHosts)
 	}
 
+	memoryBytes, nanoCPUs := computeResourceLimits(cfg.MemoryMB, cfg.CPUCores)
+
 	createCfg := containerCreateConfig{
 		Image:       cfg.Image,
 		Cmd:         cfg.Cmd,
@@ -449,6 +458,8 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 			ExtraHosts:  extraHosts,
 			DNS:         dnsServers,
 			DNSSearch:   dnsSearch,
+			Memory:      memoryBytes,
+			NanoCPUs:    nanoCPUs,
 			NetworkMode: primaryNetwork,
 			OomScoreAdj: determineOomScore(cfg.Name),
 			RestartPolicy: restartPolicy{
@@ -1046,4 +1057,127 @@ func containsAllStrings(haystack, needles []string) bool {
 		}
 	}
 	return true
+}
+
+func computeResourceLimits(memoryMB int, cpuCores float64) (memoryBytes int64, nanoCPUs int64) {
+	// Docker Engine enforces a 6 MiB minimum hard memory limit on Linux cgroups.
+	if memoryMB >= 6 {
+		memoryBytes = int64(memoryMB) * 1024 * 1024
+	}
+	if cpuCores > 0 {
+		nanoCPUs = int64(math.Round(cpuCores * 1e9))
+	}
+	return memoryBytes, nanoCPUs
+}
+
+// UpdateContainerResources updates kernel cgroup RAM/CPU limits on a running container in place (zero restart).
+func (r *DockerRunner) UpdateContainerResources(ctx context.Context, containerID string, memoryMB int, cpuCores float64) error {
+	memoryBytes, nanoCPUs := computeResourceLimits(memoryMB, cpuCores)
+	if strings.HasPrefix(r.socket, "mock") || containerID == "" || (memoryBytes == 0 && nanoCPUs == 0) {
+		return nil
+	}
+
+	payload := struct {
+		Memory   int64 `json:"Memory,omitzero"`
+		NanoCPUs int64 `json:"NanoCPUs,omitzero"`
+	}{
+		Memory:   memoryBytes,
+		NanoCPUs: nanoCPUs,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	u := fmt.Sprintf("http://localhost/containers/%s/update", url.PathEscape(containerID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("update container %s resources: %w", containerID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("update container %s resources returned %d: %s", containerID, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// ImagePruneReport summarizes reclaimed NVMe disk space from Docker image garbage collection.
+type ImagePruneReport struct {
+	ImagesDeleted  int    `json:"images_deleted"`
+	SpaceReclaimed uint64 `json:"space_reclaimed"`
+}
+
+// PruneUnusedImages reclaims disk space from dangling image layers and retired Blue/Green images older
+// than retention (default 72h, keeping recent rollback images cached locally while never touching any
+// image referenced by a running or stopped container).
+func (r *DockerRunner) PruneUnusedImages(ctx context.Context, retention time.Duration) (ImagePruneReport, error) {
+	if strings.HasPrefix(r.socket, "mock") {
+		return ImagePruneReport{}, nil
+	}
+	if retention <= 0 {
+		retention = 72 * time.Hour
+	}
+
+	danglingWindow := min(retention, 24*time.Hour)
+	danglingHours := max(1, int(danglingWindow.Hours()))
+	unusedHours := max(1, int(retention.Hours()))
+
+	var total ImagePruneReport
+	for _, pass := range []map[string][]string{
+		{"dangling": {"true"}, "until": {fmt.Sprintf("%dh", danglingHours)}},
+		{"dangling": {"false"}, "until": {fmt.Sprintf("%dh", unusedHours)}},
+	} {
+		rep, err := r.pruneImagesWithFilter(ctx, pass)
+		if err != nil {
+			return total, err
+		}
+		total.ImagesDeleted += rep.ImagesDeleted
+		total.SpaceReclaimed += rep.SpaceReclaimed
+	}
+	return total, nil
+}
+
+func (r *DockerRunner) pruneImagesWithFilter(ctx context.Context, filters map[string][]string) (ImagePruneReport, error) {
+	filterJSON, err := json.Marshal(filters)
+	if err != nil {
+		return ImagePruneReport{}, err
+	}
+
+	u := fmt.Sprintf("http://localhost/images/prune?filters=%s", url.QueryEscape(string(filterJSON)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return ImagePruneReport{}, err
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return ImagePruneReport{}, fmt.Errorf("docker images prune: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return ImagePruneReport{}, fmt.Errorf("docker images prune returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var parsed struct {
+		ImagesDeleted  []map[string]string `json:"ImagesDeleted"`
+		SpaceReclaimed uint64              `json:"SpaceReclaimed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return ImagePruneReport{}, fmt.Errorf("decode docker images prune response: %w", err)
+	}
+
+	return ImagePruneReport{
+		ImagesDeleted:  len(parsed.ImagesDeleted),
+		SpaceReclaimed: parsed.SpaceReclaimed,
+	}, nil
 }
