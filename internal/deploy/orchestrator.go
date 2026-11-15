@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -54,6 +55,8 @@ type Orchestrator struct {
 
 	extraHostsFn      func(env string) []string
 	remoteUpstreamsFn func(env, service string) []string
+	meshDNSFn         func(env string) ([]string, []string)
+	meshDNSSeedFn     func(env string, extraHosts []string)
 
 	mu          sync.RWMutex
 	activeSlots map[string]Slot
@@ -130,6 +133,59 @@ func (o *Orchestrator) remoteUpstreamsForService(env, service string) []string {
 		return nil
 	}
 	return fn(env, service)
+}
+
+// SetMeshDNSHook wires dynamic cross-server container DNS (TTL 5s) onto newly staged containers.
+// When dnsFn returns active DNS server IPs (e.g. [<overlay_ip>, "1.1.1.1"]), WireGuard 100.64.0.0/10
+// service mappings are served dynamically via DNS instead of static /etc/hosts ExtraHosts so node
+// failover takes effect within 5s with zero container restarts.
+func (o *Orchestrator) SetMeshDNSHook(
+	dnsFn func(env string) ([]string, []string),
+	seedFn func(env string, extraHosts []string),
+) {
+	o.mu.Lock()
+	o.meshDNSFn = dnsFn
+	o.meshDNSSeedFn = seedFn
+	o.mu.Unlock()
+}
+
+var meshCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+func (o *Orchestrator) resolveMeshNetworkConfig(env string, explicitExtraHosts []string) (extraHosts, dnsServers, dnsSearch []string) {
+	rawExtraHosts := dedupeNonEmptyStrings(append(slices.Clone(explicitExtraHosts), o.extraHostsForEnv(env)...))
+
+	o.mu.RLock()
+	dnsFn := o.meshDNSFn
+	seedFn := o.meshDNSSeedFn
+	o.mu.RUnlock()
+
+	if dnsFn != nil {
+		dnsServers, dnsSearch = dnsFn(env)
+	}
+	if len(dnsServers) == 0 {
+		return rawExtraHosts, nil, nil
+	}
+	if seedFn != nil && len(rawExtraHosts) > 0 {
+		seedFn(env, rawExtraHosts)
+	}
+	return stripMeshCGNATExtraHosts(rawExtraHosts), dnsServers, dnsSearch
+}
+
+func stripMeshCGNATExtraHosts(entries []string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		_, ipPart, ok := strings.Cut(strings.TrimSpace(entry), ":")
+		if ok {
+			if addr, err := netip.ParseAddr(strings.TrimSpace(ipPart)); err == nil && meshCGNATPrefix.Contains(addr) {
+				continue
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // SetPreDeployHook registers a pre-deploy backup guardrail hook
@@ -367,7 +423,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	}
 
 	dbNetwork := ResolveMigrationNetwork(envName, profile.Networks)
-	mergedExtraHosts := dedupeNonEmptyStrings(append(slices.Clone(req.ExtraHosts), o.extraHostsForEnv(envName)...))
+	mergedExtraHosts, dnsServers, dnsSearch := o.resolveMeshNetworkConfig(envName, req.ExtraHosts)
 
 	// 5. Execute Database Schema Migrations (in throwaway ephemeral container only when requested)
 	if req.RunMigrations {
@@ -375,7 +431,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		if migCmd != "" {
 			_ = o.runner.EnsureNetwork(ctx, dbNetwork)
 			o.emitProgress(req, "migrating", fmt.Sprintf("Executing database schema migration: %s", migCmd), 25)
-			migrationOutput, err := o.migrator.RunWithExtraHosts(ctx, req.Image, migCmd, envList, dbNetwork, mergedExtraHosts, resolvedBinds...)
+			migrationOutput, err := o.migrator.RunWithNetworkOptions(ctx, req.Image, migCmd, envList, dbNetwork, mergedExtraHosts, dnsServers, dnsSearch, resolvedBinds...)
 			if err != nil {
 				o.logger.Error("Database schema migration failed! Aborting deployment", "error", err, "output", migrationOutput)
 
@@ -439,6 +495,8 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		Entrypoint:    profile.Entrypoint,
 		Binds:         resolvedBinds,
 		ExtraHosts:    mergedExtraHosts,
+		DNS:           dnsServers,
+		DNSSearch:     dnsSearch,
 		HostPort:      candidatePort,
 		ContainerPort: profile.ContainerPort,
 		Networks:      profile.Networks,
@@ -605,7 +663,7 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	for _, worker := range profile.Workers {
 		workerName := fmt.Sprintf("%s-%s", worker.Name, envName)
 		o.emitProgress(req, "worker", fmt.Sprintf("Rolling out companion worker: %s", workerName), 92)
-		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles, mergedExtraHosts)
+		o.rolloutWorker(ctx, req.Image, workerName, worker, envList, profile.Networks, baseServiceName, envName, secretFiles, mergedExtraHosts, dnsServers, dnsSearch)
 	}
 
 	// 12. Drain, stop, and remove previous web slot(s) (both canonical and legacy pre-GitOps slots)
@@ -665,6 +723,8 @@ func (o *Orchestrator) rolloutWorker(
 	envName string,
 	secretFiles map[string]string,
 	extraHosts []string,
+	dnsServers []string,
+	dnsSearch []string,
 ) {
 	workerNets := worker.Networks
 	if len(workerNets) == 0 {
@@ -704,6 +764,8 @@ func (o *Orchestrator) rolloutWorker(
 		Entrypoint: worker.Entrypoint,
 		Binds:      resolvedWorkerBinds,
 		ExtraHosts: extraHosts,
+		DNS:        dnsServers,
+		DNSSearch:  dnsSearch,
 		Networks:   workerNets,
 		Labels: map[string]string{
 			"flarelens.worker":  worker.Name,

@@ -212,7 +212,7 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		labels["flarelens.aliases"] = strings.Join(aliases, ",")
 	}
 
-	mergedExtraHosts := dedupeNonEmptyStrings(append(slices.Clone(spec.ExtraHosts), o.extraHostsForEnv(envName)...))
+	mergedExtraHosts, dnsServers, dnsSearch := o.resolveMeshNetworkConfig(envName, spec.ExtraHosts)
 
 	containerID, err := o.runner.CreateContainerWithOptions(ctx, ContainerConfig{
 		Name:          containerName,
@@ -222,6 +222,8 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		Entrypoint:    spec.Entrypoint,
 		Binds:         dedupeNonEmptyStrings(spec.Volumes),
 		ExtraHosts:    mergedExtraHosts,
+		DNS:           dnsServers,
+		DNSSearch:     dnsSearch,
 		PortMappings:  spec.Ports,
 		RestartPolicy: cmp.Or(strings.TrimSpace(spec.Restart), "always"),
 		Healthcheck:   toContainerHealthcheck(spec.Healthcheck),

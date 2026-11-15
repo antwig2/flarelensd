@@ -1332,3 +1332,140 @@ func TestMultiNodeTraefikMeshUpstreamsAndDecommissionFencing(t *testing.T) {
 		t.Fatalf("expected surviving mesh replica http://100.64.0.2:28080 retained in Traefik route, got:\n%s", afterDrain)
 	}
 }
+
+func TestMeshDNSHookPromotesExtraHostsToDynamicDNSWithFallback(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "fl-dns-")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "d.sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	created := make(map[string]containerCreateConfig)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/images/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"pulled"}`))
+	})
+	mux.HandleFunc("/networks/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		var cfg containerCreateConfig
+		_ = json.NewDecoder(r.Body).Decode(&cfg)
+		mu.Lock()
+		created[name] = cfg
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"id-` + name + `"}`))
+	})
+	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/json") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	runner := NewDockerRunner("unix://" + sockPath)
+	orch := NewOrchestrator(runner, NewHealthProber(), NewTraefikRouteFlipper(t.TempDir()), nil, "node-1", nil)
+
+	var seededEnv string
+	var seededEntries []string
+	dnsActive := true
+
+	orch.SetMeshRoutingHooks(
+		func(env string) []string {
+			return []string{"workflow:100.64.0.2", "workflow-uat:100.64.0.2"}
+		},
+		nil,
+	)
+	orch.SetMeshDNSHook(
+		func(env string) ([]string, []string) {
+			if !dnsActive {
+				return nil, nil
+			}
+			return []string{"100.64.0.1", "1.1.1.1"}, []string{env + ".mesh", "mesh"}
+		},
+		func(env string, extraHosts []string) {
+			seededEnv = env
+			seededEntries = slices.Clone(extraHosts)
+		},
+	)
+
+	// 1. When MagicDNS is bound on <overlay_ip>:53, HostConfig.Dns & DnsSearch are injected
+	// and 100.64.0.0/10 entries are omitted from /etc/hosts so TTL=5s DNS failover works live.
+	resp1 := orch.ReconcileSingleton(t.Context(), SingletonSpec{
+		DeploymentID:  "dns-active-1",
+		Service:       "billing-worker",
+		Env:           "uat",
+		Image:         "ghcr.io/example/billing:v1",
+		ContainerName: "billing-worker-uat",
+		Networks:      []string{"app-uat"},
+		ExtraHosts:    []string{"erp.internal:192.168.10.25", "cache:100.64.0.3"},
+	})
+	if resp1.Status != "success" {
+		t.Fatalf("singleton reconcile with active Mesh DNS failed: %s", resp1.Message)
+	}
+
+	mu.Lock()
+	activeCfg := created["billing-worker-uat"]
+	mu.Unlock()
+
+	if !slices.Equal(activeCfg.HostConfig.DNS, []string{"100.64.0.1", "1.1.1.1"}) {
+		t.Fatalf("want HostConfig.Dns=[100.64.0.1 1.1.1.1], got %v", activeCfg.HostConfig.DNS)
+	}
+	if !slices.Equal(activeCfg.HostConfig.DNSSearch, []string{"uat.mesh", "mesh"}) {
+		t.Fatalf("want HostConfig.DnsSearch=[uat.mesh mesh], got %v", activeCfg.HostConfig.DNSSearch)
+	}
+	if seededEnv != "uat" || !slices.Contains(seededEntries, "workflow:100.64.0.2") || !slices.Contains(seededEntries, "cache:100.64.0.3") {
+		t.Fatalf("expected CGNAT ExtraHosts seeded into MagicDNS, got env=%q entries=%v", seededEnv, seededEntries)
+	}
+	for _, eh := range activeCfg.HostConfig.ExtraHosts {
+		if strings.Contains(eh, "100.64.0.") {
+			t.Fatalf("expected 100.64.0.x stripped from /etc/hosts ExtraHosts when Mesh DNS is active, got %v", activeCfg.HostConfig.ExtraHosts)
+		}
+	}
+	if !slices.Contains(activeCfg.HostConfig.ExtraHosts, "host.docker.internal:host-gateway") ||
+		!slices.Contains(activeCfg.HostConfig.ExtraHosts, "erp.internal:192.168.10.25") {
+		t.Fatalf("expected non-mesh ExtraHosts preserved, got %v", activeCfg.HostConfig.ExtraHosts)
+	}
+
+	// 2. When MagicDNS is unavailable (e.g. unprivileged host without port 53), ExtraHosts fallback stays intact.
+	dnsActive = false
+	resp2 := orch.ReconcileSingleton(t.Context(), SingletonSpec{
+		DeploymentID:  "dns-fallback-1",
+		Service:       "audit-worker",
+		Env:           "uat",
+		Image:         "ghcr.io/example/audit:v1",
+		ContainerName: "audit-worker-uat",
+		Networks:      []string{"app-uat"},
+	})
+	if resp2.Status != "success" {
+		t.Fatalf("singleton reconcile fallback failed: %s", resp2.Message)
+	}
+
+	mu.Lock()
+	fallbackCfg := created["audit-worker-uat"]
+	mu.Unlock()
+
+	if len(fallbackCfg.HostConfig.DNS) != 0 {
+		t.Fatalf("expected empty HostConfig.Dns in fallback mode, got %v", fallbackCfg.HostConfig.DNS)
+	}
+	if !slices.Contains(fallbackCfg.HostConfig.ExtraHosts, "workflow:100.64.0.2") {
+		t.Fatalf("expected ExtraHosts fallback to retain workflow:100.64.0.2, got %v", fallbackCfg.HostConfig.ExtraHosts)
+	}
+}

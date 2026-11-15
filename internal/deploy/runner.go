@@ -160,6 +160,8 @@ type networkEndpointConfig struct {
 type containerHostConfig struct {
 	Binds         []string                      `json:"Binds,omitempty"`
 	ExtraHosts    []string                      `json:"ExtraHosts,omitempty"`
+	DNS           []string                      `json:"Dns,omitempty"`
+	DNSSearch     []string                      `json:"DnsSearch,omitempty"`
 	PortBindings  map[string][]portBindingEntry `json:"PortBindings,omitempty"`
 	NetworkMode   string                        `json:"NetworkMode,omitempty"`
 	OomScoreAdj   int                           `json:"OomScoreAdj"`
@@ -198,6 +200,8 @@ type ContainerConfig struct {
 	Entrypoint    []string
 	Binds         []string
 	ExtraHosts    []string
+	DNS           []string
+	DNSSearch     []string
 	HostPort      int
 	ContainerPort int
 	PortMappings  []string
@@ -424,9 +428,11 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 	}
 	_ = r.EnsureNetwork(ctx, primaryNetwork)
 
-	var extraHosts []string
+	var extraHosts, dnsServers, dnsSearch []string
 	if primaryNetwork != "host" && primaryNetwork != "none" {
 		extraHosts = dedupeNonEmptyStrings(append([]string{"host.docker.internal:host-gateway"}, cfg.ExtraHosts...))
+		dnsServers = dedupeNonEmptyStrings(cfg.DNS)
+		dnsSearch = dedupeNonEmptyStrings(cfg.DNSSearch)
 	} else if len(cfg.ExtraHosts) > 0 {
 		extraHosts = dedupeNonEmptyStrings(cfg.ExtraHosts)
 	}
@@ -441,6 +447,8 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 		HostConfig: containerHostConfig{
 			Binds:       cfg.Binds,
 			ExtraHosts:  extraHosts,
+			DNS:         dnsServers,
+			DNSSearch:   dnsSearch,
 			NetworkMode: primaryNetwork,
 			OomScoreAdj: determineOomScore(cfg.Name),
 			RestartPolicy: restartPolicy{

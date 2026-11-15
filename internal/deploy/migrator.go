@@ -43,6 +43,21 @@ func (m *MigrationRunner) RunWithExtraHosts(
 	extraHosts []string,
 	binds ...string,
 ) (string, error) {
+	return m.RunWithNetworkOptions(ctx, image, command, envVars, network, extraHosts, nil, nil, binds...)
+}
+
+// RunWithNetworkOptions executes a database migration command inside an ephemeral container with dynamic mesh DNS and/or ExtraHosts.
+func (m *MigrationRunner) RunWithNetworkOptions(
+	ctx context.Context,
+	image string,
+	command string,
+	envVars []string,
+	network string,
+	extraHosts []string,
+	dnsServers []string,
+	dnsSearch []string,
+	binds ...string,
+) (string, error) {
 	if command == "" {
 		command = "migrate up"
 	}
@@ -50,6 +65,19 @@ func (m *MigrationRunner) RunWithExtraHosts(
 	cmdArgs := []string{"run", "--rm"}
 	if network != "" {
 		cmdArgs = append(cmdArgs, "--network", network)
+	}
+
+	if network != "host" && network != "none" {
+		for _, srv := range dnsServers {
+			if trimmed := strings.TrimSpace(srv); trimmed != "" {
+				cmdArgs = append(cmdArgs, "--dns", trimmed)
+			}
+		}
+		for _, dom := range dnsSearch {
+			if trimmed := strings.TrimSpace(dom); trimmed != "" {
+				cmdArgs = append(cmdArgs, "--dns-search", trimmed)
+			}
+		}
 	}
 
 	for _, hostMap := range extraHosts {

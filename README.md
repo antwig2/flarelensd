@@ -44,7 +44,8 @@ It unifies 4 major systems that previously required 4 separate tools:
 #### 2. Zero-Trust Networking (Replaces Bastion Hosts / Tailscale / OpenVPN)
 - **Serverless Edge Coordinator**: Coordinated serverlessly across 330+ Cloudflare edge PoPs (Workers + KV) with RFC 8628 Device Flow browser SSO (`@yourcompany.com`). **Zero coordinator VMs or SQLite databases to maintain.**
 - **Pure P2P WireGuard Data Plane**: Encrypted point-to-point overlay (`100.64.0.0/10` CGNAT) running directly over UDP with **< 0.1ms kernel latency and $0 egress fees**.
-- **Traefik Mesh Ingress & Multi-Node Service Router**: Internal dashboards and container services bind directly to `100.64.0.x:<mesh_port>` (`flarelens0`), leaving zero public firewall ports open while forwarding cross-node service traffic (`ExtraHosts` + round-robin WireGuard TCP listeners) across cluster peers.
+- **Traefik Mesh Ingress & Multi-Node Service Router**: Internal dashboards and container services bind directly to `100.64.0.x:<mesh_port>` (`flarelens0`), leaving zero public firewall ports open while forwarding cross-node service traffic across cluster peers.
+- **Dynamic Cross-Server Service Mesh DNS (`TTL 5s`)**: Runs an embedded UDP+TCP split-horizon `MagicDNSServer` on `<overlay_ip>:53` and injects Docker `HostConfig.Dns` (`[<overlay_ip>, "1.1.1.1"]`) + `DnsSearch` (`["<env>.mesh", "mesh"]`) into staged containers, workers, migrations, and singletons — resolving `<service>` and `<service>.<env>.mesh` with round-robin multi-replica `A` records and 5-second failover TTL (zero container restarts on node drain/failover, with automatic `/etc/hosts` `ExtraHosts` fallback when port 53 is unavailable).
 - **Outbound-Only Signaling**: Eliminates open inbound SSH ports (port 22) to the public internet; port 22 is strictly bound to the private WireGuard mesh.
 
 #### 3. GitOps & Zero-Downtime Deployments (Replaces Portainer / Jenkins / ArgoCD)

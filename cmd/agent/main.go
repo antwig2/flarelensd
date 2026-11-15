@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.6"
+	Version = "0.2.7"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -483,6 +483,16 @@ func main() {
 	defer serviceRouter.Close()
 	deployOrchestrator.SetMeshRoutingHooks(serviceRouter.ExtraHostsForEnv, serviceRouter.RemoteUpstreamURLs)
 
+	var magicDNS *mesh.MagicDNSServer
+	if cfg.Mesh.Enabled {
+		magicDNS = mesh.NewMagicDNSServer(mesh.MagicDNSConfig{
+			DomainSuffix:  ".mesh",
+			InterfaceName: cfg.Mesh.Interface,
+		}, logger)
+		defer magicDNS.Stop()
+		deployOrchestrator.SetMeshDNSHook(magicDNS.DNSHookForEnv, magicDNS.SeedFromExtraHosts)
+	}
+
 	var meshMgr *mesh.Manager
 	if cfg.Mesh.Enabled {
 		meshPrivKey, meshPubKey, err := mesh.LoadOrGenerateKeypair(cfg.Mesh.KeyPath)
@@ -500,7 +510,7 @@ func main() {
 			meshMgr = mesh.NewManager(meshCfg, meshPrivKey, meshPubKey, nil, logger)
 
 			// Async registration with Cloudflare Worker Mesh Control Plane
-			go func(mgr *mesh.Manager) {
+			go func(mgr *mesh.Manager, dnsSrv *mesh.MagicDNSServer) {
 				if cfg.ControlPlane.Endpoint == "" {
 					return
 				}
@@ -538,14 +548,25 @@ func main() {
 						)
 						mgr.SetOverlayIP(regResp.Peer.OverlayIP)
 						serviceRouter.SetOverlayIP(regResp.Peer.OverlayIP)
+						if dnsSrv != nil {
+							dnsSrv.UpdatePeers(regResp.Peers, regResp.Peer.OverlayIP, cfg.Identity.Hostname)
+						}
 						if err := mgr.InitInterface(context.Background()); err != nil {
 							logger.Warn("WireGuard interface init warning (requires kernel module & CAP_NET_ADMIN)", "error", err)
 						} else {
 							_ = mgr.SyncPeers(context.Background(), regResp.Peers)
+							if dnsSrv != nil && regResp.Peer.OverlayIP != "" {
+								if dnsErr := dnsSrv.RebindOverlayIP(ctx, regResp.Peer.OverlayIP); dnsErr != nil {
+									logger.Warn("MagicDNS overlay port-53 bind warning (retaining ExtraHosts fallback)",
+										"overlay_ip", regResp.Peer.OverlayIP,
+										"error", dnsErr,
+									)
+								}
+							}
 						}
 					}
 				}
-			}(meshMgr)
+			}(meshMgr, magicDNS)
 		}
 	}
 
@@ -577,7 +598,7 @@ func main() {
 		if err := natsClient.StartEmbedded(ctx, embedOpts); err != nil {
 			logger.Error("Failed to start embedded NATS server", "error", err)
 		} else {
-			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, agentUpdater, cfg, logger)
+			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, magicDNS, agentUpdater, cfg, logger)
 		}
 	} else if cfg.NATS.Mode != "disabled" && cfg.NATS.Mode != "none" && cfg.NATS.Mode != "off" {
 		if err := natsClient.Connect(ctx); err != nil {
@@ -586,7 +607,7 @@ func main() {
 				"error", err,
 			)
 		} else {
-			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, agentUpdater, cfg, logger)
+			registerCommandListeners(natsClient, deployOrchestrator, backupMgr, flagStore, meshMgr, magicDNS, agentUpdater, cfg, logger)
 		}
 	} else {
 		logger.Info("NATS transport disabled; operating in HTTPS / Cloudflare Edge Control Plane mode")
@@ -600,7 +621,7 @@ func main() {
 	}
 
 	// 6. Configure piggybacked command, mesh peer, placement & feature-flag synchronization on the 15s heartbeat loop
-	configureControlPlaneSync(ctx, reporter, flagStore, backupMgr, deployOrchestrator, agentUpdater, meshMgr, serviceRouter, cfg, logger)
+	configureControlPlaneSync(ctx, reporter, flagStore, backupMgr, deployOrchestrator, agentUpdater, meshMgr, serviceRouter, magicDNS, cfg, logger)
 
 	// 6a. Launch background telemetry + piggybacked control-plane sync loop (every 15s)
 	go reporter.StartHeartbeatLoop(ctx)
@@ -647,6 +668,7 @@ func registerCommandListeners(
 	backupMgr *backup.Manager,
 	flagStore *flags.Store,
 	meshMgr *mesh.Manager,
+	magicDNS *mesh.MagicDNSServer,
 	agentUpdater *updater.Updater,
 	cfg *config.Config,
 	logger *slog.Logger,
@@ -871,6 +893,9 @@ func registerCommandListeners(
 				logger.Info("Received dynamic mesh peer broadcast via NATS", "peers_count", len(peers))
 				if err := meshMgr.SyncPeers(context.Background(), peers); err != nil {
 					logger.Warn("Failed to sync WireGuard mesh peers", "error", err)
+				}
+				if magicDNS != nil {
+					magicDNS.UpdatePeers(peers, meshMgr.OverlayIP(), cfg.Identity.Hostname)
 				}
 			}
 		}
@@ -1123,6 +1148,7 @@ func configureControlPlaneSync(
 	agentUpdater *updater.Updater,
 	meshMgr *mesh.Manager,
 	serviceRouter *mesh.ServiceRouter,
+	magicDNS *mesh.MagicDNSServer,
 	cfg *config.Config,
 	logger *slog.Logger,
 ) {
@@ -1145,34 +1171,50 @@ func configureControlPlaneSync(
 	)
 
 	reporter.SetClusterSyncHandler(func(hbCtx context.Context, overlayIP string, rawPeers json.RawMessage, rawEndpoints json.RawMessage) {
+		effectiveIP := overlayIP
+		if effectiveIP == "" && meshMgr != nil {
+			effectiveIP = meshMgr.OverlayIP()
+		}
 		if overlayIP != "" {
 			if meshMgr != nil && meshMgr.OverlayIP() == "" {
 				meshMgr.SetOverlayIP(overlayIP)
+				_ = meshMgr.InitInterface(hbCtx)
 			}
 			if serviceRouter != nil {
 				serviceRouter.SetOverlayIP(overlayIP)
 			}
-		}
-		if meshMgr != nil && len(rawPeers) > 0 {
-			var peers []mesh.Peer
-			if err := json.Unmarshal(rawPeers, &peers); err == nil && len(peers) > 0 {
-				if err := meshMgr.SyncPeers(hbCtx, peers); err != nil {
-					logger.Debug("Piggybacked WireGuard peer sync skipped or warning", "error", err)
+			if magicDNS != nil && magicDNS.ContainerDNSServer() == "" {
+				if err := magicDNS.RebindOverlayIP(ctx, overlayIP); err != nil {
+					logger.Debug("MagicDNS overlay port-53 bind skipped on heartbeat", "overlay_ip", overlayIP, "error", err)
 				}
 			}
 		}
-		if serviceRouter != nil && len(rawEndpoints) > 0 {
+		if len(rawPeers) > 0 {
+			var peers []mesh.Peer
+			if err := json.Unmarshal(rawPeers, &peers); err == nil && len(peers) > 0 {
+				if meshMgr != nil {
+					if err := meshMgr.SyncPeers(hbCtx, peers); err != nil {
+						logger.Debug("Piggybacked WireGuard peer sync skipped or warning", "error", err)
+					}
+				}
+				if magicDNS != nil {
+					magicDNS.UpdatePeers(peers, effectiveIP, cfg.Identity.Hostname)
+				}
+			}
+		}
+		if len(rawEndpoints) > 0 {
 			var endpoints []mesh.ClusterEndpoint
 			if err := json.Unmarshal(rawEndpoints, &endpoints); err == nil {
-				effectiveIP := overlayIP
-				if effectiveIP == "" && meshMgr != nil {
-					effectiveIP = meshMgr.OverlayIP()
+				if magicDNS != nil {
+					magicDNS.UpdateServiceEndpoints(effectiveIP, endpoints)
 				}
-				serviceRouter.UpdateEndpoints(effectiveIP, endpoints)
-				if orchestrator != nil {
-					for _, g := range serviceRouter.RouteGroups() {
-						if !g.HasLocalNode && len(g.RemoteURLs) > 0 && len(g.Domains) > 0 {
-							_ = orchestrator.SyncRemoteOnlyRoute(g.Env, g.Service, g.Domains, g.RemoteURLs, g.HealthPath)
+				if serviceRouter != nil {
+					serviceRouter.UpdateEndpoints(effectiveIP, endpoints)
+					if orchestrator != nil {
+						for _, g := range serviceRouter.RouteGroups() {
+							if !g.HasLocalNode && len(g.RemoteURLs) > 0 && len(g.Domains) > 0 {
+								_ = orchestrator.SyncRemoteOnlyRoute(g.Env, g.Service, g.Domains, g.RemoteURLs, g.HealthPath)
+							}
 						}
 					}
 				}
