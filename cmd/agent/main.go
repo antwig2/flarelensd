@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.9"
+	Version = "0.2.10"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -1103,6 +1103,7 @@ type NodeCommand struct {
 	Env                   string                  `json:"env"`
 	ContainerName         string                  `json:"container_name"`
 	Restart               string                  `json:"restart"`
+	AdoptOnly             bool                    `json:"adopt_only,omitzero"`
 	Ports                 []string                `json:"ports"`
 	Healthcheck           *deploy.HealthcheckSpec `json:"healthcheck"`
 	ForceRecreateStateful bool                    `json:"force_recreate_stateful"`
@@ -1484,6 +1485,7 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 					Image:                 c.Image,
 					ContainerName:         c.ContainerName,
 					Restart:               c.Restart,
+					AdoptOnly:             c.AdoptOnly,
 					Networks:              c.Networks,
 					Aliases:               c.Aliases,
 					Volumes:               c.Volumes,

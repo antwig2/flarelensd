@@ -123,7 +123,8 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 			}
 		}
 
-		if spec.AdoptOnly && !spec.ForceRecreateStateful {
+		existingHash := strings.TrimSpace(existing.Labels["flarelens.spec_hash"])
+		if spec.AdoptOnly && (existingHash == "" || existingHash == specHash) && !spec.ForceRecreateStateful {
 			return DeployResponse{
 				DeploymentID: spec.DeploymentID,
 				Service:      service,
@@ -134,7 +135,6 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 			}
 		}
 
-		existingHash := strings.TrimSpace(existing.Labels["flarelens.spec_hash"])
 		if existingHash == specHash || (existingHash == "" && existing.Image == spec.Image && statefulProtected) {
 			return DeployResponse{
 				DeploymentID: spec.DeploymentID,
