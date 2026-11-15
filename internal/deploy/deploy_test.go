@@ -1646,3 +1646,107 @@ func TestContainerCgroupResourceLimitsLiveUpdateAndAutoImagePrune(t *testing.T) 
 		t.Fatalf("unexpected pass 2 unused image prune filter: %s", gotFilters[1])
 	}
 }
+
+func TestSingletonRAMSecretFilesAndPersistentDataDirBootstrap(t *testing.T) {
+	tmpRoot := t.TempDir()
+	missingDataDir := filepath.Join(tmpRoot, "prod", "data", "postgres")
+	missingInitDir := filepath.Join(tmpRoot, "prod", "postgres", "init")
+	missingBenthosCfg := filepath.Join(tmpRoot, "prod", "services", "benthos", "config.yaml")
+
+	initSQL := "CREATE DATABASE app_prod;\nCREATE DATABASE workflow_prod;\n"
+	benthosYAML := "input:\n  postgres_cdc:\n    slot_name: cdc_slot\n"
+
+	pgBinds := resolveSingletonVolumeBinds(
+		[]string{
+			missingDataDir + ":/var/lib/postgresql",
+			missingInitDir + ":/docker-entrypoint-initdb.d:ro",
+		},
+		"prod",
+		"postgres",
+		map[string]string{
+			"/docker-entrypoint-initdb.d/01-init.sql": initSQL,
+			"/app/config/jwt-private.pem":             "-----BEGIN PRIVATE KEY-----\ntest\n",
+			"/app/config/jwt-public.pem":              "-----BEGIN PUBLIC KEY-----\ntest\n",
+			"/app/config/saml-private.key":            "-----BEGIN PRIVATE KEY-----\nsaml\n",
+		},
+		nil,
+	)
+
+	// 1. Missing persistent rw directory must be auto-created
+	if info, err := os.Stat(missingDataDir); err != nil || !info.IsDir() {
+		t.Fatalf("expected persistent data dir %s to be auto-created, err=%v", missingDataDir, err)
+	}
+	// Missing read-only host init dir must NOT be created on disk when covered by RAM secret files
+	if _, err := os.Stat(missingInitDir); !os.IsNotExist(err) {
+		t.Fatalf("expected missing read-only init dir %s NOT to be created on disk", missingInitDir)
+	}
+
+	foundDataBind := false
+	foundRAMInitBind := ""
+	foundRAMConfigBind := ""
+	for _, b := range pgBinds {
+		if b == missingDataDir+":/var/lib/postgresql" {
+			foundDataBind = true
+		}
+		if strings.HasSuffix(b, ":/docker-entrypoint-initdb.d:ro") && !strings.HasPrefix(b, missingInitDir+":") {
+			foundRAMInitBind, _, _ = strings.Cut(b, ":")
+		}
+		if strings.HasSuffix(b, ":/app/config:ro") {
+			foundRAMConfigBind, _, _ = strings.Cut(b, ":")
+		}
+	}
+	if !foundDataBind {
+		t.Fatalf("expected persistent data bind in %v", pgBinds)
+	}
+	if foundRAMInitBind == "" {
+		t.Fatalf("expected RAM tmpfs bind for /docker-entrypoint-initdb.d in %v", pgBinds)
+	}
+	sqlBytes, err := os.ReadFile(filepath.Join(foundRAMInitBind, "01-init.sql"))
+	if err != nil || string(sqlBytes) != initSQL {
+		t.Fatalf("unexpected materialized 01-init.sql: err=%v content=%q", err, string(sqlBytes))
+	}
+	sqlInfo, _ := os.Stat(filepath.Join(foundRAMInitBind, "01-init.sql"))
+	if sqlInfo.Mode().Perm() != 0644 {
+		t.Fatalf("expected non-private SQL init file mode 0644 for non-root postgres UID, got %04o", sqlInfo.Mode().Perm())
+	}
+	privInfo, _ := os.Stat(filepath.Join(foundRAMConfigBind, "jwt-private.pem"))
+	keyInfo, _ := os.Stat(filepath.Join(foundRAMConfigBind, "saml-private.key"))
+	pubInfo, _ := os.Stat(filepath.Join(foundRAMConfigBind, "jwt-public.pem"))
+	if privInfo.Mode().Perm() != 0600 || keyInfo.Mode().Perm() != 0600 {
+		t.Fatalf("expected private keys to enforce 0600 permissions, got jwt=%04o saml=%04o", privInfo.Mode().Perm(), keyInfo.Mode().Perm())
+	}
+	if pubInfo.Mode().Perm() != 0644 {
+		t.Fatalf("expected public key mode 0644, got %04o", pubInfo.Mode().Perm())
+	}
+	baseInfo, _ := os.Stat(selectRAMSecretsBaseDir())
+	if baseInfo.Mode().Perm() != 0700 {
+		t.Fatalf("expected RAM secrets root dir to enforce strict 0700 host isolation, got %04o", baseInfo.Mode().Perm())
+	}
+
+	// 2. Root-level container config file (/benthos.yaml) materializes cleanly when host config file is absent
+	cdcBinds := resolveSingletonVolumeBinds(
+		[]string{missingBenthosCfg + ":/benthos.yaml:ro"},
+		"prod",
+		"benthos-cdc",
+		map[string]string{
+			"/benthos.yaml": benthosYAML,
+		},
+		nil,
+	)
+	if len(cdcBinds) != 1 || !strings.HasSuffix(cdcBinds[0], ":/benthos.yaml:ro") {
+		t.Fatalf("expected exactly 1 RAM bind for /benthos.yaml, got %v", cdcBinds)
+	}
+	hostBenthosFile, _, _ := strings.Cut(cdcBinds[0], ":")
+	cdcBytes, err := os.ReadFile(hostBenthosFile)
+	if err != nil || string(cdcBytes) != benthosYAML {
+		t.Fatalf("unexpected materialized /benthos.yaml: err=%v content=%q", err, string(cdcBytes))
+	}
+
+	// 3. Verify resolveTargetDBFromSecrets extracts DB name from DATABASE_URL when DB_NAME is absent
+	gotDB := resolveTargetDBFromSecrets("", map[string]string{
+		"DATABASE_URL": "postgres://app_user:secret@postgres:5432/workflow_prod?sslmode=disable",
+	})
+	if gotDB != "workflow_prod" {
+		t.Fatalf("want workflow_prod from DATABASE_URL, got %q", gotDB)
+	}
+}

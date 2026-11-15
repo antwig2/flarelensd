@@ -7,7 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -30,6 +33,7 @@ type SingletonSpec struct {
 	Image                 string            `json:"image"`
 	ContainerName         string            `json:"container_name"`
 	Restart               string            `json:"restart,omitempty"`
+	AdoptOnly             bool              `json:"adopt_only,omitzero"`
 	Networks              []string          `json:"networks,omitempty"`
 	Aliases               []string          `json:"aliases,omitempty"`
 	Volumes               []string          `json:"volumes,omitempty"`
@@ -98,13 +102,15 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 
 	if existing != nil && existing.Running {
 		// Always heal missing networks, DNS aliases, and cgroup RAM/CPU limits live with zero container restart.
-		if err := o.runner.PromoteNetworkAliases(ctx, existing.ID, networks, aliases); err != nil {
-			o.logger.Warn("Failed to heal singleton network aliases",
-				"container", containerName,
-				"networks", networks,
-				"aliases", aliases,
-				"error", err,
-			)
+		if !spec.AdoptOnly {
+			if err := o.runner.PromoteNetworkAliases(ctx, existing.ID, networks, aliases); err != nil {
+				o.logger.Warn("Failed to heal singleton network aliases",
+					"container", containerName,
+					"networks", networks,
+					"aliases", aliases,
+					"error", err,
+				)
+			}
 		}
 		if spec.MemoryMB >= 6 || spec.CPUCores > 0 {
 			if err := o.runner.UpdateContainerResources(ctx, existing.ID, spec.MemoryMB, spec.CPUCores); err != nil {
@@ -114,6 +120,17 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 					"cpu_cores", spec.CPUCores,
 					"error", err,
 				)
+			}
+		}
+
+		if spec.AdoptOnly && !spec.ForceRecreateStateful {
+			return DeployResponse{
+				DeploymentID: spec.DeploymentID,
+				Service:      service,
+				Status:       "success",
+				ActiveSlot:   "singleton",
+				Message:      fmt.Sprintf("Adopted running singleton %s without restart (cgroup limits synced)", containerName),
+				DurationMS:   time.Since(startTime).Milliseconds(),
 			}
 		}
 
@@ -200,10 +217,22 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		}
 	}
 
-	activeSecrets := maps.Clone(spec.Secrets)
-	if len(activeSecrets) == 0 {
-		activeSecrets = loadFallbackEnv(service, envName)
+	rawSecrets := maps.Clone(spec.Secrets)
+	if len(rawSecrets) == 0 {
+		rawSecrets = loadFallbackEnv(service, envName)
 	}
+	activeSecrets := make(map[string]string, len(rawSecrets))
+	secretFiles := make(map[string]string)
+	for k, v := range rawSecrets {
+		if containerPath, ok := strings.CutPrefix(k, "__FLARELENS_FILE__"); ok {
+			if strings.TrimSpace(containerPath) != "" && v != "" {
+				secretFiles[containerPath] = v
+			}
+			continue
+		}
+		activeSecrets[k] = v
+	}
+
 	envList := make([]string, 0, len(activeSecrets)+3)
 	envList = append(envList,
 		fmt.Sprintf("DEPLOY_ENV=%s", envName),
@@ -212,6 +241,8 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 	for _, k := range slices.Sorted(maps.Keys(activeSecrets)) {
 		envList = append(envList, fmt.Sprintf("%s=%s", k, activeSecrets[k]))
 	}
+
+	resolvedBinds := resolveSingletonVolumeBinds(spec.Volumes, envName, service, secretFiles, o.logger)
 
 	labels := map[string]string{
 		"flarelens.managed":   "true",
@@ -232,7 +263,7 @@ func (o *Orchestrator) ReconcileSingleton(ctx context.Context, spec SingletonSpe
 		EnvVars:       envList,
 		Cmd:           spec.Command,
 		Entrypoint:    spec.Entrypoint,
-		Binds:         dedupeNonEmptyStrings(spec.Volumes),
+		Binds:         resolvedBinds,
 		ExtraHosts:    mergedExtraHosts,
 		DNS:           dnsServers,
 		DNSSearch:     dnsSearch,
@@ -351,4 +382,100 @@ func computeSingletonSpecHash(spec SingletonSpec, envName string, networks, alia
 	raw, _ := json.Marshal(canonical)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:16])
+}
+
+func resolveSingletonVolumeBinds(
+	volumes []string,
+	envName string,
+	service string,
+	secretFiles map[string]string,
+	logger *slog.Logger,
+) []string {
+	cleanVols := dedupeNonEmptyStrings(volumes)
+	resolved := make([]string, 0, len(cleanVols)+len(secretFiles))
+	mountedDests := make(map[string]bool)
+
+	for _, b := range cleanVols {
+		parts := strings.Split(b, ":")
+		if len(parts) < 2 {
+			resolved = append(resolved, b)
+			continue
+		}
+		hostPath := strings.TrimSpace(parts[0])
+		rawDest := filepath.ToSlash(strings.TrimSpace(parts[1]))
+		dest := strings.TrimSuffix(rawDest, "/")
+		if dest == "" && strings.HasPrefix(rawDest, "/") {
+			dest = "/"
+		}
+
+		// Named Docker volumes (not host paths) pass straight through
+		if !strings.HasPrefix(hostPath, "/") && !strings.HasPrefix(hostPath, ".") {
+			resolved = append(resolved, b)
+			if dest != "" {
+				mountedDests[dest] = true
+			}
+			continue
+		}
+
+		// Existing host file or directory passes straight through
+		if _, statErr := os.Stat(hostPath); statErr == nil {
+			resolved = append(resolved, b)
+			if dest != "" {
+				mountedDests[dest] = true
+			}
+			continue
+		}
+
+		// Missing host path covered by RAM-materialized __FLARELENS_FILE__ entries
+		if isCoveredBySecretFiles(dest, secretFiles) {
+			continue
+		}
+
+		isReadOnly := len(parts) >= 3 && slices.Contains(strings.Split(parts[2], ","), "ro")
+		if isReadOnly || looksLikeConfigFilePath(hostPath) {
+			if logger != nil {
+				logger.Warn("Skipping missing read-only/config singleton host volume", "service", service, "bind", b)
+			}
+			continue
+		}
+
+		// Auto-bootstrap missing persistent read-write data directory on fresh hosts
+		if mkErr := os.MkdirAll(hostPath, 0755); mkErr == nil {
+			resolved = append(resolved, b)
+			if dest != "" {
+				mountedDests[dest] = true
+			}
+		} else if logger != nil {
+			logger.Warn("Failed to create singleton persistent volume directory", "path", hostPath, "error", mkErr)
+		}
+	}
+
+	resolved = append(resolved, materializeSecretFilesToBinds(secretFiles, mountedDests, service, envName)...)
+	return resolved
+}
+
+func isCoveredBySecretFiles(dest string, secretFiles map[string]string) bool {
+	if dest == "" || len(secretFiles) == 0 {
+		return false
+	}
+	for rawPath, content := range secretFiles {
+		if content == "" {
+			continue
+		}
+		clean := filepath.ToSlash(strings.TrimSpace(rawPath))
+		if clean == dest || strings.HasPrefix(clean, dest+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeConfigFilePath(hostPath string) bool {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(hostPath)))
+	switch ext {
+	case ".yaml", ".yml", ".json", ".toml", ".conf", ".ini", ".sql", ".pem", ".key", ".crt", ".env", ".sh":
+		return true
+	default:
+		return false
+	}
 }

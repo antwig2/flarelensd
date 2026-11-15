@@ -215,3 +215,20 @@ func TestManagerBackupMetadata(t *testing.T) {
 		t.Errorf("Expected 0 items, got %d", len(items))
 	}
 }
+
+func TestResolveContainerCandidatesMultiEnv(t *testing.T) {
+	ctx := WithDeployEnv(t.Context(), "production")
+	if got := DeployEnvFromContext(ctx); got != "prod" {
+		t.Fatalf("want normalized deploy env 'prod', got %q", got)
+	}
+
+	cands := ResolveContainerCandidates("acme-uat-postgres", "prod", "billing_prod")
+	if len(cands) == 0 || cands[0] != "acme-prod-postgres" {
+		t.Fatalf("expected primary candidate 'acme-prod-postgres', got %v", cands)
+	}
+
+	inferred := ResolveContainerCandidates("postgres-uat", "", "workflow_prod")
+	if len(inferred) == 0 || inferred[0] != "postgres-prod" {
+		t.Fatalf("expected inferred candidate 'postgres-prod' from targetDB suffix, got %v", inferred)
+	}
+}

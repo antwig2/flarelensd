@@ -4,9 +4,11 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +21,7 @@ import (
 )
 
 type targetDBContextKey struct{}
+type deployEnvContextKey struct{}
 
 // WithTargetDB attaches an optional target database name hint to ctx for pre-deploy snapshot/rollback hooks.
 func WithTargetDB(ctx context.Context, targetDB string) context.Context {
@@ -31,6 +34,23 @@ func WithTargetDB(ctx context.Context, targetDB string) context.Context {
 // TargetDBFromContext retrieves an optional target database name hint from ctx.
 func TargetDBFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(targetDBContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithDeployEnv attaches an optional normalized deployment environment hint to ctx.
+func WithDeployEnv(ctx context.Context, envName string) context.Context {
+	norm := normalizeEnvShort(envName)
+	if norm == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, deployEnvContextKey{}, norm)
+}
+
+// DeployEnvFromContext retrieves an optional deployment environment hint from ctx.
+func DeployEnvFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(deployEnvContextKey{}).(string); ok {
 		return v
 	}
 	return ""
@@ -271,12 +291,8 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 		req.PreDeploySnapshot = true
 	}
 
-	targetDB := cmp.Or(
-		strings.TrimSpace(req.TargetDB),
-		envValueByKeyOrSuffix(req.Secrets, "DB_NAME"),
-		envValueByKeyOrSuffix(req.Secrets, "POSTGRES_DB"),
-	)
-	hookCtx := WithTargetDB(ctx, targetDB)
+	targetDB := resolveTargetDBFromSecrets(req.TargetDB, req.Secrets)
+	hookCtx := WithDeployEnv(WithTargetDB(ctx, targetDB), req.Env)
 
 	o.logger.Info("Starting Blue/Green deployment",
 		"service", req.Service,
@@ -477,11 +493,8 @@ func (o *Orchestrator) Deploy(ctx context.Context, req DeployRequest) DeployResp
 	resolvedBinds := resolveVolumeBinds(profile.Volumes, envName, string(candidateSlot), baseServiceName, secretFiles)
 
 	if targetDB == "" {
-		targetDB = cmp.Or(
-			envValueByKeyOrSuffix(activeSecrets, "DB_NAME"),
-			envValueByKeyOrSuffix(activeSecrets, "POSTGRES_DB"),
-		)
-		hookCtx = WithTargetDB(ctx, targetDB)
+		targetDB = resolveTargetDBFromSecrets("", activeSecrets)
+		hookCtx = WithDeployEnv(WithTargetDB(ctx, targetDB), envName)
 	}
 
 	dbNetwork := ResolveMigrationNetwork(envName, profile.Networks)
@@ -984,6 +997,28 @@ func envValueByKeyOrSuffix(envMap map[string]string, suffix string) string {
 		if upper == wantUpper || strings.HasSuffix(upper, "_"+wantUpper) {
 			if val := strings.TrimSpace(envMap[k]); val != "" {
 				return val
+			}
+		}
+	}
+	return ""
+}
+
+func resolveTargetDBFromSecrets(explicitDB string, envMap map[string]string) string {
+	if trimmed := strings.TrimSpace(explicitDB); trimmed != "" {
+		return trimmed
+	}
+	if db := cmp.Or(
+		envValueByKeyOrSuffix(envMap, "DB_NAME"),
+		envValueByKeyOrSuffix(envMap, "POSTGRES_DB"),
+	); db != "" {
+		return db
+	}
+	for _, suffix := range []string{"DATABASE_URL", "DB_URL", "POSTGRES_URL"} {
+		if rawURL := envValueByKeyOrSuffix(envMap, suffix); rawURL != "" {
+			if parsed, err := url.Parse(rawURL); err == nil {
+				if dbName := strings.Trim(parsed.Path, "/"); dbName != "" {
+					return dbName
+				}
 			}
 		}
 	}
@@ -1703,50 +1738,115 @@ func resolveVolumeBinds(
 		}
 	}
 
-	if len(secretFiles) > 0 {
-		byDir := make(map[string]map[string]string)
-		for containerPath, content := range secretFiles {
-			clean := filepath.ToSlash(strings.TrimSpace(containerPath))
-			if !strings.HasPrefix(clean, "/") || content == "" {
-				continue
-			}
-			dir := strings.TrimSuffix(filepath.ToSlash(filepath.Dir(clean)), "/")
-			base := filepath.Base(clean)
-			if dir == "" || dir == "." || base == "" || base == "." || base == "/" {
-				continue
-			}
-			if mountedDests[dir] {
-				continue
-			}
-			if byDir[dir] == nil {
-				byDir[dir] = make(map[string]string)
-			}
-			byDir[dir][base] = content
-		}
+	resolvedBinds = append(resolvedBinds, materializeSecretFilesToBinds(secretFiles, mountedDests, baseServiceName, envName)...)
+	return resolvedBinds
+}
 
-		for containerDir, files := range byDir {
-			hostBase := selectRAMSecretsBaseDir()
-			safeDirSlug := strings.ReplaceAll(strings.TrimPrefix(containerDir, "/"), "/", "_")
-			hostDir := filepath.Join(hostBase, fmt.Sprintf("%s-%s", baseServiceName, normalizeEnvShort(envName)), safeDirSlug)
-			if err := os.MkdirAll(hostDir, 0700); err != nil {
-				continue
+func secretFileMode(fileName string) fs.FileMode {
+	lower := strings.ToLower(strings.TrimSpace(fileName))
+	if strings.HasSuffix(lower, ".key") || (strings.HasSuffix(lower, ".pem") && strings.Contains(lower, "priv")) {
+		return 0600
+	}
+	return 0644
+}
+
+func materializeSecretFilesToBinds(
+	secretFiles map[string]string,
+	mountedDests map[string]bool,
+	baseServiceName string,
+	envName string,
+) []string {
+	if len(secretFiles) == 0 {
+		return nil
+	}
+
+	rootFiles := make(map[string]string)
+	byDir := make(map[string]map[string]string)
+
+	for containerPath, content := range secretFiles {
+		clean := filepath.ToSlash(strings.TrimSpace(containerPath))
+		if !strings.HasPrefix(clean, "/") || content == "" {
+			continue
+		}
+		rawDir := filepath.ToSlash(filepath.Dir(clean))
+		base := filepath.Base(clean)
+		if base == "" || base == "." || base == "/" {
+			continue
+		}
+		if rawDir == "/" {
+			if !mountedDests[clean] {
+				rootFiles[clean] = content
 			}
-			wroteAll := true
-			for fileName, fileContent := range files {
-				targetFile := filepath.Join(hostDir, fileName)
-				if err := os.WriteFile(targetFile, []byte(fileContent), 0600); err != nil {
-					wroteAll = false
-					break
+			continue
+		}
+		dir := strings.TrimSuffix(rawDir, "/")
+		if dir == "" || dir == "." || mountedDests[dir] {
+			continue
+		}
+		if byDir[dir] == nil {
+			byDir[dir] = make(map[string]string)
+		}
+		byDir[dir][base] = content
+	}
+
+	if len(rootFiles) == 0 && len(byDir) == 0 {
+		return nil
+	}
+
+	hostBase := selectRAMSecretsBaseDir()
+	_ = os.Chmod(hostBase, 0700)
+
+	svcBaseDir := filepath.Join(hostBase, fmt.Sprintf("%s-%s", baseServiceName, normalizeEnvShort(envName)))
+	if err := os.MkdirAll(svcBaseDir, 0755); err != nil {
+		return nil
+	}
+	_ = os.Chmod(svcBaseDir, 0755)
+
+	binds := make([]string, 0, len(rootFiles)+len(byDir))
+
+	if len(rootFiles) > 0 {
+		rootHostDir := filepath.Join(svcBaseDir, "_root")
+		if err := os.MkdirAll(rootHostDir, 0755); err == nil {
+			_ = os.Chmod(rootHostDir, 0755)
+			for _, cleanPath := range slices.Sorted(maps.Keys(rootFiles)) {
+				fileName := filepath.Base(cleanPath)
+				targetFile := filepath.Join(rootHostDir, fileName)
+				mode := secretFileMode(fileName)
+				if err := os.WriteFile(targetFile, []byte(rootFiles[cleanPath]), mode); err == nil {
+					_ = os.Chmod(targetFile, mode)
+					binds = append(binds, fmt.Sprintf("%s:%s:ro", targetFile, cleanPath))
+					mountedDests[cleanPath] = true
 				}
-			}
-			if wroteAll {
-				resolvedBinds = append(resolvedBinds, fmt.Sprintf("%s:%s:ro", hostDir, containerDir))
-				mountedDests[containerDir] = true
 			}
 		}
 	}
 
-	return resolvedBinds
+	for _, containerDir := range slices.Sorted(maps.Keys(byDir)) {
+		files := byDir[containerDir]
+		safeDirSlug := strings.ReplaceAll(strings.TrimPrefix(containerDir, "/"), "/", "_")
+		hostDir := filepath.Join(svcBaseDir, safeDirSlug)
+		if err := os.MkdirAll(hostDir, 0755); err != nil {
+			continue
+		}
+		_ = os.Chmod(hostDir, 0755)
+
+		wroteAll := true
+		for _, fileName := range slices.Sorted(maps.Keys(files)) {
+			targetFile := filepath.Join(hostDir, fileName)
+			mode := secretFileMode(fileName)
+			if err := os.WriteFile(targetFile, []byte(files[fileName]), mode); err != nil {
+				wroteAll = false
+				break
+			}
+			_ = os.Chmod(targetFile, mode)
+		}
+		if wroteAll {
+			binds = append(binds, fmt.Sprintf("%s:%s:ro", hostDir, containerDir))
+			mountedDests[containerDir] = true
+		}
+	}
+
+	return binds
 }
 
 func selectRAMSecretsBaseDir() string {
@@ -1754,11 +1854,15 @@ func selectRAMSecretsBaseDir() string {
 		if isExistingDir(candidate) {
 			dir := filepath.Join(candidate, "flarelens-secrets")
 			if err := os.MkdirAll(dir, 0700); err == nil {
+				_ = os.Chmod(dir, 0700)
 				return dir
 			}
 		}
 	}
-	return filepath.Join(os.TempDir(), "flarelens-secrets")
+	dir := filepath.Join(os.TempDir(), "flarelens-secrets")
+	_ = os.MkdirAll(dir, 0700)
+	_ = os.Chmod(dir, 0700)
+	return dir
 }
 
 // SyncRemoteOnlyRoute configures local Traefik to load-balance across remote mesh replicas when no local replica runs on this node.

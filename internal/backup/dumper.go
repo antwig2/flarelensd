@@ -1,13 +1,39 @@
 package backup
 
 import (
+	"cmp"
 	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strconv"
+	"strings"
 )
+
+type deployEnvContextKey struct{}
+
+// WithDeployEnv attaches an optional deployment environment hint (e.g. "uat", "prod") to ctx
+// so multi-environment hosts resolve the matching database container automatically.
+func WithDeployEnv(ctx context.Context, envName string) context.Context {
+	trimmed := strings.ToLower(strings.TrimSpace(envName))
+	if trimmed == "production" {
+		trimmed = "prod"
+	}
+	if trimmed == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, deployEnvContextKey{}, trimmed)
+}
+
+// DeployEnvFromContext retrieves an optional deployment environment hint from ctx.
+func DeployEnvFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(deployEnvContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // PostgresDumper handles zero-disk streaming pg_dump and psql restore
 type PostgresDumper struct {
@@ -39,6 +65,77 @@ func NewPostgresDumper(mode, serviceName, host string, port int, user, database 
 	}
 }
 
+// ResolveContainerCandidates returns prioritized Postgres container name candidates
+// when multiple environments share a single host node.
+func ResolveContainerCandidates(baseServiceName, envHint, targetDB string) []string {
+	env := strings.ToLower(strings.TrimSpace(envHint))
+	if env == "production" {
+		env = "prod"
+	}
+	if env == "" {
+		lowerDB := strings.ToLower(strings.TrimSpace(targetDB))
+		for _, known := range []string{"prod", "uat", "staging", "dev"} {
+			if strings.HasSuffix(lowerDB, "_"+known) || strings.HasSuffix(lowerDB, "-"+known) {
+				env = known
+				break
+			}
+		}
+	}
+	if env == "" {
+		if baseServiceName != "" {
+			return []string{baseServiceName}
+		}
+		return nil
+	}
+
+	candidates := make([]string, 0, 4)
+	addUnique := func(name string) {
+		if name != "" && !slices.Contains(candidates, name) {
+			candidates = append(candidates, name)
+		}
+	}
+
+	if baseServiceName != "" {
+		swapped := swapEnvTokenInContainerName(baseServiceName, env)
+		addUnique(swapped)
+	}
+	addUnique(fmt.Sprintf("postgres-%s", env))
+	addUnique(fmt.Sprintf("%s-postgres", env))
+	addUnique(baseServiceName)
+	return candidates
+}
+
+func swapEnvTokenInContainerName(name, targetEnv string) string {
+	for _, token := range []string{"uat", "prod", "production", "staging", "dev"} {
+		mid := "-" + token + "-"
+		if strings.Contains(name, mid) {
+			return strings.Replace(name, mid, "-"+targetEnv+"-", 1)
+		}
+		if prefix, ok := strings.CutSuffix(name, "-"+token); ok {
+			return prefix + "-" + targetEnv
+		}
+		if suffix, ok := strings.CutPrefix(name, token+"-"); ok {
+			return targetEnv + "-" + suffix
+		}
+	}
+	return name
+}
+
+func (d *PostgresDumper) resolveActiveContainer(ctx context.Context, targetDB string) string {
+	envHint := DeployEnvFromContext(ctx)
+	candidates := ResolveContainerCandidates(d.serviceName, envHint, targetDB)
+	if len(candidates) <= 1 {
+		return cmp.Or(d.serviceName, "postgres")
+	}
+	for _, c := range candidates {
+		out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", c).Output()
+		if err == nil && strings.TrimSpace(string(out)) == "true" {
+			return c
+		}
+	}
+	return d.serviceName
+}
+
 // StreamDump launches pg_dump and streams gzipped bytes through an io.PipeReader
 func (d *PostgresDumper) StreamDump(ctx context.Context) (io.ReadCloser, error) {
 	return d.StreamDumpDB(ctx, d.database)
@@ -52,7 +149,8 @@ func (d *PostgresDumper) StreamDumpDB(ctx context.Context, targetDB string) (io.
 	var cmd *exec.Cmd
 
 	if d.mode == "container" {
-		cmd = exec.CommandContext(ctx, "docker", "exec", "-i", d.serviceName, "pg_dump", "-U", d.user, targetDB)
+		container := d.resolveActiveContainer(ctx, targetDB)
+		cmd = exec.CommandContext(ctx, "docker", "exec", "-i", container, "pg_dump", "-U", d.user, targetDB)
 	} else {
 		cmd = exec.CommandContext(ctx, "pg_dump", "-h", d.host, "-p", strconv.Itoa(d.port), "-U", d.user, targetDB)
 	}
@@ -104,7 +202,8 @@ func (d *PostgresDumper) Restore(ctx context.Context, source io.Reader, targetDB
 
 	var cmd *exec.Cmd
 	if d.mode == "container" {
-		cmd = exec.CommandContext(ctx, "docker", "exec", "-i", d.serviceName, "psql", "-U", d.user, targetDB)
+		container := d.resolveActiveContainer(ctx, targetDB)
+		cmd = exec.CommandContext(ctx, "docker", "exec", "-i", container, "psql", "-U", d.user, targetDB)
 	} else {
 		cmd = exec.CommandContext(ctx, "psql", "-h", d.host, "-p", strconv.Itoa(d.port), "-U", d.user, targetDB)
 	}

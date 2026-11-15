@@ -38,7 +38,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.8"
+	Version = "0.2.9"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -442,20 +442,22 @@ func main() {
 	// Hook pre-deploy database snapshot guardrail into deploy orchestrator
 	deployOrchestrator.SetPreDeployHook(func(hookCtx context.Context, service, tag string) error {
 		targetDB := resolveTargetDB(hookCtx)
+		envCtx := backup.WithDeployEnv(hookCtx, deploy.DeployEnvFromContext(hookCtx))
 		logger.Info("Executing pre-deploy database snapshot guardrail", "service", service, "database", targetDB, "tag", tag)
 		activeBackupOps.Add(1)
 		defer activeBackupOps.Add(-1)
-		_, hookErr := backupMgr.CreateBackupForDB(hookCtx, tag, targetDB)
+		_, hookErr := backupMgr.CreateBackupForDB(envCtx, tag, targetDB)
 		return hookErr
 	})
 
 	// Hook automated snapshot rollback in case of migration failure
 	deployOrchestrator.SetRollbackHook(func(hookCtx context.Context, service, tag string) error {
 		targetDB := resolveTargetDB(hookCtx)
+		envCtx := backup.WithDeployEnv(hookCtx, deploy.DeployEnvFromContext(hookCtx))
 		logger.Warn("Executing automated snapshot rollback following migration failure", "service", service, "database", targetDB, "tag", tag)
 		activeBackupOps.Add(1)
 		defer activeBackupOps.Add(-1)
-		return backupMgr.RestoreLatestMatchingTag(hookCtx, tag, targetDB)
+		return backupMgr.RestoreLatestMatchingTag(envCtx, tag, targetDB)
 	})
 
 	// Start automated cron scheduler for backups
