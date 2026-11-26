@@ -13,6 +13,56 @@ type WorkerSpec struct {
 	CPUCores   float64  `json:"cpu_cores,omitzero"`   // optional worker CPU limit override (cores, e.g. 0.5)
 }
 
+// JobSpec defines a declarative scheduled CronJob or on-demand One-Off Job inside a service manifest
+type JobSpec struct {
+	Name              string   `json:"name"`                         // e.g. "nightly-reconciliation"
+	Schedule          string   `json:"schedule,omitempty"`           // optional 5-field UTC cron expression
+	Command           []string `json:"command,omitempty"`            // e.g. ["/app/server", "jobs", "reconcile"]
+	Entrypoint        []string `json:"entrypoint,omitempty"`         // optional entrypoint override
+	Volumes           []string `json:"volumes,omitempty"`            // optional volume bind mounts
+	Networks          []string `json:"networks,omitempty"`           // optional docker networks override
+	TimeoutSeconds    int      `json:"timeout_seconds,omitzero"`     // max execution duration in seconds
+	ConcurrencyPolicy string   `json:"concurrency_policy,omitempty"` // "forbid" (default), "allow", or "replace"
+	MemoryMB          int      `json:"memory_mb,omitzero"`           // optional job RAM limit override (MB)
+	CPUCores          float64  `json:"cpu_cores,omitzero"`           // optional job CPU limit override (cores)
+}
+
+// JobRunRequest defines an isolated ephemeral container job execution request dispatched to a host node
+type JobRunRequest struct {
+	RunID          string            `json:"run_id"`
+	JobName        string            `json:"job_name"`
+	Service        string            `json:"service"`
+	Env            string            `json:"env"`
+	Image          string            `json:"image"`
+	Command        []string          `json:"command,omitempty"`
+	Entrypoint     []string          `json:"entrypoint,omitempty"`
+	Volumes        []string          `json:"volumes,omitempty"`
+	Networks       []string          `json:"networks,omitempty"`
+	Network        string            `json:"network,omitempty"`
+	Secrets        map[string]string `json:"secrets,omitempty"`
+	ExtraHosts     []string          `json:"extra_hosts,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitzero"`
+	MemoryMB       int               `json:"memory_mb,omitzero"`
+	CPUCores       float64           `json:"cpu_cores,omitzero"`
+	Trigger        string            `json:"trigger,omitempty"` // "cron", "manual", "api"
+	NodeID         string            `json:"node_id,omitempty"`
+}
+
+// JobRunResponse reports the terminal state, exit code, and bounded log tail of an executed job
+type JobRunResponse struct {
+	RunID       string `json:"run_id"`
+	JobName     string `json:"job_name"`
+	Service     string `json:"service"`
+	Env         string `json:"env"`
+	NodeID      string `json:"node_id"`
+	ContainerID string `json:"container_id,omitempty"`
+	Status      string `json:"status"` // "succeeded", "failed", "timed_out"
+	ExitCode    int    `json:"exit_code"`
+	Output      string `json:"output"`
+	Error       string `json:"error,omitempty"`
+	DurationMS  int64  `json:"duration_ms"`
+}
+
 // DeployRequest defines a declarative deployment trigger
 type DeployRequest struct {
 	DeploymentID      string            `json:"deployment_id"`

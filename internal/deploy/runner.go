@@ -167,6 +167,7 @@ type containerHostConfig struct {
 	DNSSearch     []string                      `json:"DnsSearch,omitempty"`
 	Memory        int64                         `json:"Memory,omitzero"`
 	NanoCPUs      int64                         `json:"NanoCPUs,omitzero"`
+	SecurityOpt   []string                      `json:"SecurityOpt,omitempty"`
 	PortBindings  map[string][]portBindingEntry `json:"PortBindings,omitempty"`
 	NetworkMode   string                        `json:"NetworkMode,omitempty"`
 	OomScoreAdj   int                           `json:"OomScoreAdj"`
@@ -209,6 +210,7 @@ type ContainerConfig struct {
 	DNSSearch     []string
 	MemoryMB      int
 	CPUCores      float64
+	SecurityOpt   []string
 	HostPort      int
 	ContainerPort int
 	PortMappings  []string
@@ -460,6 +462,7 @@ func (r *DockerRunner) CreateContainerWithOptions(ctx context.Context, cfg Conta
 			DNSSearch:   dnsSearch,
 			Memory:      memoryBytes,
 			NanoCPUs:    nanoCPUs,
+			SecurityOpt: dedupeNonEmptyStrings(cfg.SecurityOpt),
 			NetworkMode: primaryNetwork,
 			OomScoreAdj: determineOomScore(cfg.Name),
 			RestartPolicy: restartPolicy{
@@ -638,6 +641,120 @@ func (r *DockerRunner) RemoveContainer(ctx context.Context, containerID string) 
 	}
 
 	return nil
+}
+
+// WaitContainer blocks until the container exits (or ctx is canceled) and returns its exit code and any engine wait error message.
+func (r *DockerRunner) WaitContainer(ctx context.Context, containerID string) (int, string, error) {
+	if strings.HasPrefix(r.socket, "mock") {
+		return 0, "", nil
+	}
+	u := fmt.Sprintf("http://localhost/containers/%s/wait?condition=not-running", url.PathEscape(containerID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return -1, "", err
+	}
+
+	// Use a client without the fixed 180s pull timeout so long-running jobs obey ctx deadline directly.
+	waitClient := &http.Client{Transport: r.client.Transport}
+	resp, err := waitClient.Do(req)
+	if err != nil {
+		return -1, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return -1, "", fmt.Errorf("container wait returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var result struct {
+		StatusCode int `json:"StatusCode"`
+		Error      *struct {
+			Message string `json:"Message"`
+		} `json:"Error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return -1, "", err
+	}
+	var waitErrMsg string
+	if result.Error != nil {
+		waitErrMsg = strings.TrimSpace(result.Error.Message)
+	}
+	return result.StatusCode, waitErrMsg, nil
+}
+
+// FetchContainerLogs reads combined stdout/stderr tail lines from a container, demultiplexing Docker's 8-byte stream frames.
+func (r *DockerRunner) FetchContainerLogs(ctx context.Context, containerID string, tailLines int) (string, error) {
+	if strings.HasPrefix(r.socket, "mock") || strings.TrimSpace(containerID) == "" {
+		return "", nil
+	}
+	tailParam := "250"
+	if tailLines > 0 {
+		tailParam = fmt.Sprintf("%d", tailLines)
+	}
+	u := fmt.Sprintf("http://localhost/containers/%s/logs?stdout=true&stderr=true&tail=%s", url.PathEscape(containerID), tailParam)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("container logs returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	const maxLogBytes = 64 * 1024
+	rawBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxLogBytes))
+	if err != nil {
+		return "", err
+	}
+	return demuxDockerLogStream(rawBytes, 32*1024), nil
+}
+
+func demuxDockerLogStream(raw []byte, maxOut int) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	// Docker non-TTY stream header: [stream_type(0..2), 0, 0, 0, size_be32]
+	if len(raw) >= 8 && raw[0] <= 2 && raw[1] == 0 && raw[2] == 0 && raw[3] == 0 {
+		var out bytes.Buffer
+		pos := 0
+		validFrames := true
+		for pos+8 <= len(raw) {
+			if raw[pos] > 2 || raw[pos+1] != 0 || raw[pos+2] != 0 || raw[pos+3] != 0 {
+				validFrames = false
+				break
+			}
+			frameLen := int(uint32(raw[pos+4])<<24 | uint32(raw[pos+5])<<16 | uint32(raw[pos+6])<<8 | uint32(raw[pos+7]))
+			pos += 8
+			if frameLen < 0 || pos+frameLen > len(raw) {
+				// Partial trailing frame (due to LimitReader truncation)
+				out.Write(raw[pos:])
+				pos = len(raw)
+				break
+			}
+			out.Write(raw[pos : pos+frameLen])
+			pos += frameLen
+		}
+		if validFrames && pos == len(raw) {
+			s := strings.TrimSpace(out.String())
+			if maxOut > 0 && len(s) > maxOut {
+				return s[len(s)-maxOut:]
+			}
+			return s
+		}
+	}
+	s := strings.TrimSpace(string(raw))
+	if maxOut > 0 && len(s) > maxOut {
+		return s[len(s)-maxOut:]
+	}
+	return s
 }
 
 // FindContainerIDByName looks up an existing container ID by name

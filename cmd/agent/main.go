@@ -1188,6 +1188,20 @@ func registerCommandListeners(
 		_, _ = nc.Subscribe("flarelens.fleet.all.update", handleUpdate)
 	}
 
+	// 12. One-Off & Scheduled Container Job Runner
+	jobSubj := fmt.Sprintf("flarelens.node.%s.job.run", nodeID)
+	_, _ = nc.Subscribe(jobSubj, func(msg *nats.Msg) {
+		var jReq deploy.JobRunRequest
+		if err := json.Unmarshal(msg.Data, &jReq); err != nil {
+			logger.Error("Malformed job run payload", "error", err)
+			return
+		}
+		if jReq.NodeID != "" && jReq.NodeID != "all" && jReq.NodeID != nodeID {
+			return
+		}
+		go executeContainerJob(orchestrator, jReq, msg.Reply, nc, nodeID, cfg, logger)
+	})
+
 	logger.Info("NATS command listeners registered",
 		"reboot_subject", rebootSubj,
 		"config_subject", configSubj,
@@ -1320,6 +1334,64 @@ func executeSelfUpdate(
 	}, logger)
 }
 
+func executeContainerJob(
+	orchestrator *deploy.Orchestrator,
+	jReq deploy.JobRunRequest,
+	replySubject string,
+	nc *transport.NATSClient,
+	nodeID string,
+	cfg *config.Config,
+	logger *slog.Logger,
+) {
+	statusURL := ""
+	if cfg.ControlPlane.Endpoint != "" {
+		statusURL = fmt.Sprintf("%s/api/v1/control/jobs/status", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"))
+	}
+	jReq.NodeID = nodeID
+
+	reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+		"run_id":     jReq.RunID,
+		"job_name":   jReq.JobName,
+		"service":    jReq.Service,
+		"env":        jReq.Env,
+		"node_id":    nodeID,
+		"status":     "running",
+		"started_at": time.Now().UTC().Format(time.RFC3339),
+	}, logger)
+
+	if orchestrator == nil {
+		reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+			"run_id":    jReq.RunID,
+			"job_name":  jReq.JobName,
+			"service":   jReq.Service,
+			"env":       jReq.Env,
+			"node_id":   nodeID,
+			"status":    "failed",
+			"exit_code": 1,
+			"error":     "container orchestrator not initialized on node",
+		}, logger)
+		return
+	}
+
+	res := orchestrator.RunJob(context.Background(), jReq)
+	if nc != nil && replySubject != "" {
+		_ = nc.PublishJSON(replySubject, res)
+	}
+	reportHTTPStatusSync(statusURL, cfg.ControlPlane.EnrollToken, map[string]any{
+		"run_id":       res.RunID,
+		"job_name":     res.JobName,
+		"service":      res.Service,
+		"env":          res.Env,
+		"node_id":      nodeID,
+		"container_id": res.ContainerID,
+		"status":       res.Status,
+		"exit_code":    res.ExitCode,
+		"output":       res.Output,
+		"error":        res.Error,
+		"duration_ms":  res.DurationMS,
+	}, logger)
+}
+
 type NodeCommand struct {
 	ID                    string                  `json:"id"`
 	Type                  string                  `json:"type"`
@@ -1369,6 +1441,10 @@ type NodeCommand struct {
 	CPUCores              float64                 `json:"cpu_cores,omitzero"`
 	UntilHours            int                     `json:"until_hours,omitzero"`
 	DrainSeconds          int                     `json:"drain_seconds,omitzero"`
+	TimeoutSeconds        int                     `json:"timeout_seconds,omitzero"`
+	RunID                 string                  `json:"run_id,omitempty"`
+	JobName               string                  `json:"job_name,omitempty"`
+	Trigger               string                  `json:"trigger,omitempty"`
 	ExtraHosts            []string                `json:"extra_hosts,omitempty"`
 	RemoteUpstreams       []string                `json:"remote_upstreams,omitempty"`
 	ForceRemoveStateful   bool                    `json:"force_remove_stateful,omitzero"`
@@ -1793,6 +1869,31 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 						)
 					}
 				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+		case "run_job":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				jReq := deploy.JobRunRequest{
+					RunID:          cmp.Or(c.RunID, c.ID),
+					JobName:        c.JobName,
+					Service:        c.Service,
+					Env:            c.Env,
+					Image:          c.Image,
+					Command:        c.Command,
+					Entrypoint:     c.Entrypoint,
+					Volumes:        c.Volumes,
+					Networks:       c.Networks,
+					Network:        c.Network,
+					Secrets:        c.Secrets,
+					ExtraHosts:     c.ExtraHosts,
+					TimeoutSeconds: c.TimeoutSeconds,
+					MemoryMB:       c.MemoryMB,
+					CPUCores:       c.CPUCores,
+					Trigger:        c.Trigger,
+					NodeID:         nodeID,
+				}
+				executeContainerJob(orchestrator, jReq, "", nil, nodeID, cfg, logger)
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
 		case "backup":
