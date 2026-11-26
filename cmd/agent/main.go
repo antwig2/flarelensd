@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -38,15 +40,47 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.10"
+	Version = "0.2.11"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
 )
 
+func printCLIUsage() {
+	fmt.Printf("FlareLens Host Agent & WireGuard Mesh CLI (v%s)\n\n", Version)
+	fmt.Println("Usage:")
+	fmt.Println("  flarelensd [flags]                  Run host daemon (reconciler, mesh & 15s heartbeat)")
+	fmt.Println("  flarelensd login [flags]            Authenticate workstation via browser SSO & join mesh")
+	fmt.Println("  flarelensd connect [flags]          Join WireGuard mesh using enrollment token")
+	fmt.Println("  flarelensd down [flags]             Disconnect WireGuard interface & revert MagicDNS")
+	fmt.Println("  flarelensd logout [flags]           Revoke mesh session, tear down interface & clear state")
+	fmt.Println("  flarelensd status                   Show WireGuard mesh peers, handshakes & transfer stats")
+	fmt.Println("  flarelensd ssh [user@]host.mesh     Open zero-trust SSH session over private mesh")
+	fmt.Println("  flarelensd proxy [flags]            Start unprivileged local SOCKS5 / HTTP CONNECT proxy")
+	fmt.Println("  flarelensd backup [flags]           Stream on-demand PostgreSQL backup directly to R2")
+	fmt.Println("  flarelensd self-update [flags]      Atomically upgrade flarelensd with SHA-256 verification")
+	fmt.Println("  flarelensd leave [flags]            Unenroll host & stop service (keeps binary & Docker apps)")
+	fmt.Println("  flarelensd uninstall [flags]        Unenroll host, remove service & binary (keeps Docker apps)")
+	fmt.Println("  flarelensd --version                Print version information")
+	fmt.Println()
+}
+
+func isInteractiveTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version" || os.Args[1] == "-v") {
 		fmt.Printf("FlareLens Host Agent v%s (commit: %s, built at: %s, built by: %s)\n", Version, Commit, Date, BuiltBy)
+		os.Exit(0)
+	}
+
+	if len(os.Args) > 1 && (os.Args[1] == "help" || os.Args[1] == "--help" || os.Args[1] == "-h") {
+		printCLIUsage()
 		os.Exit(0)
 	}
 
@@ -314,6 +348,202 @@ func main() {
 			fmt.Fprintf(os.Stderr, "❌ Login failed: %v\n", err)
 			os.Exit(1)
 		}
+		os.Exit(0)
+	}
+
+	// Subcommand: down / disconnect / logout (Disconnects WireGuard mesh interface and optionally revokes session)
+	if len(os.Args) > 1 && (os.Args[1] == "down" || os.Args[1] == "disconnect" || os.Args[1] == "logout" ||
+		(os.Args[1] == "mesh" && len(os.Args) > 2 && (os.Args[2] == "down" || os.Args[2] == "disconnect" || os.Args[2] == "logout"))) {
+		subCmd := os.Args[1]
+		subArgs := os.Args[2:]
+		if os.Args[1] == "mesh" {
+			subCmd = os.Args[2]
+			subArgs = os.Args[3:]
+		}
+		isLogout := subCmd == "logout"
+
+		downFlags := flag.NewFlagSet(subCmd, flag.ExitOnError)
+		ifaceName := downFlags.String("interface", "", "WireGuard interface name (default: flarelens0)")
+		controlURL := downFlags.String("control", os.Getenv("FLARELENS_CONTROL_URL"), "FlareLens Control Plane URL")
+		token := downFlags.String("token", os.Getenv("FLARELENS_ENROLL_TOKEN"), "Optional control plane auth token")
+		keyPath := downFlags.String("key", "", "Optional path to WireGuard private key file")
+		revoke := downFlags.Bool("revoke", isLogout, "Deregister this peer on the FlareLens Control Plane")
+		purgeState := downFlags.Bool("purge", isLogout, "Remove cached mesh-state.json and WireGuard .conf")
+		purgeKeys := downFlags.Bool("purge-keys", false, "Also delete local WireGuard and SSH keypairs")
+		_ = downFlags.Parse(subArgs)
+
+		if *controlURL == "" || *token == "" {
+			if loadedCfg, err := config.Load(nil); err == nil {
+				*controlURL = cmp.Or(*controlURL, loadedCfg.ControlPlane.Endpoint)
+				*token = cmp.Or(*token, loadedCfg.ControlPlane.EnrollToken)
+				if *ifaceName == "" {
+					*ifaceName = loadedCfg.Mesh.Interface
+				}
+				if *keyPath == "" {
+					*keyPath = loadedCfg.Mesh.KeyPath
+				}
+			}
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		res, err := mesh.RunDisconnect(ctx, mesh.DisconnectOptions{
+			InterfaceName: *ifaceName,
+			ControlURL:    *controlURL,
+			AuthToken:     *token,
+			KeyPath:       *keyPath,
+			RevokeRemote:  *revoke,
+			PurgeState:    *purgeState,
+			PurgeKeys:     *purgeKeys,
+		}, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Mesh disconnect error: %v\n", err)
+			if os.Geteuid() != 0 && runtime.GOOS != "windows" {
+				fmt.Fprintln(os.Stderr, "💡 Tip: tearing down the kernel WireGuard interface requires root privileges (run with sudo).")
+			}
+			os.Exit(1)
+		}
+
+		if isLogout {
+			fmt.Printf("✅ Logged out of FlareLens Mesh (interface %s down).\n", res.Interface)
+		} else {
+			fmt.Printf("✅ Disconnected FlareLens Mesh interface (%s).\n", res.Interface)
+		}
+		if res.RemoteRevoked {
+			fmt.Println("  • Control Plane : Peer deregistered")
+		}
+		if res.HostsCleaned {
+			fmt.Println("  • MagicDNS      : /etc/hosts entries cleaned")
+		}
+		if len(res.RemovedFiles) > 0 {
+			fmt.Printf("  • Cleaned State : %d file(s) removed\n", len(res.RemovedFiles))
+		}
+		for _, w := range res.Warnings {
+			fmt.Fprintf(os.Stderr, "  ⚠️  %s\n", w)
+		}
+		os.Exit(0)
+	}
+
+	// Subcommand: leave / uninstall (Cleanly unenroll server/workstation, stop daemon & remove installation; Docker workloads stay running)
+	if len(os.Args) > 1 && (os.Args[1] == "uninstall" || os.Args[1] == "leave") {
+		subCmd := os.Args[1]
+		defaultKeepBin := subCmd == "leave"
+
+		uninstFlags := flag.NewFlagSet(subCmd, flag.ExitOnError)
+		configPath := uninstFlags.String("config", "", "Optional path to agent.yaml")
+		controlURL := uninstFlags.String("control", os.Getenv("FLARELENS_CONTROL_URL"), "FlareLens Control Plane URL")
+		token := uninstFlags.String("token", os.Getenv("FLARELENS_ENROLL_TOKEN"), "Control plane auth token")
+		nodeID := uninstFlags.String("node-id", os.Getenv("FLARELENS_NODE_ID"), "Node ID to unenroll")
+		ifaceName := uninstFlags.String("interface", "", "WireGuard interface name (default: flarelens0)")
+		keepConfig := uninstFlags.Bool("keep-config", false, "Preserve /etc/flarelens configuration directory")
+		keepBinary := uninstFlags.Bool("keep-binary", defaultKeepBin, "Keep flarelensd binary in /usr/local/bin")
+		assumeYes := uninstFlags.Bool("yes", false, "Skip interactive confirmation prompt")
+		assumeY := uninstFlags.Bool("y", false, "Skip interactive confirmation prompt (shorthand)")
+		_ = uninstFlags.Parse(os.Args[2:])
+
+		if os.Geteuid() != 0 && runtime.GOOS != "windows" {
+			fmt.Fprintf(os.Stderr, "❌ Root privileges are required to stop systemd services and remove host files. Run: sudo flarelensd %s\n", subCmd)
+			os.Exit(1)
+		}
+
+		var cfgArgs []string
+		if *configPath != "" {
+			cfgArgs = []string{"--config", *configPath}
+		}
+		var meshKeyPath string
+		if loadedCfg, err := config.Load(cfgArgs); err == nil {
+			*controlURL = cmp.Or(*controlURL, loadedCfg.ControlPlane.Endpoint)
+			*token = cmp.Or(*token, loadedCfg.ControlPlane.EnrollToken)
+			*nodeID = cmp.Or(*nodeID, loadedCfg.Identity.NodeID)
+			*ifaceName = cmp.Or(*ifaceName, loadedCfg.Mesh.Interface)
+			meshKeyPath = loadedCfg.Mesh.KeyPath
+		}
+		if meshState, err := mesh.LoadState(); err == nil && meshState != nil {
+			*controlURL = cmp.Or(*controlURL, meshState.ControlURL)
+			*ifaceName = cmp.Or(*ifaceName, meshState.Interface)
+			meshKeyPath = cmp.Or(meshKeyPath, meshState.PrivateKeyPath)
+		}
+
+		if !*assumeYes && !*assumeY && isInteractiveTerminal() {
+			fmt.Println("================================================================")
+			fmt.Printf("  FlareLens Host Agent — %s\n", strings.ToUpper(subCmd))
+			fmt.Println("================================================================")
+			if *nodeID != "" {
+				fmt.Printf("  • Node ID           : %s\n", *nodeID)
+			}
+			if *controlURL != "" {
+				fmt.Printf("  • Control Plane     : %s\n", *controlURL)
+			}
+			fmt.Println("  • Docker Workloads  : KEPT RUNNING (containers & volumes untouched)")
+			if *keepBinary {
+				fmt.Println("  • Agent Binary      : KEPT on disk (--keep-binary)")
+			} else {
+				fmt.Println("  • Agent Binary      : WILL BE REMOVED")
+			}
+			fmt.Print("\nProceed? [y/N]: ")
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			ans := strings.ToLower(strings.TrimSpace(line))
+			if ans != "y" && ans != "yes" {
+				fmt.Println("Aborted.")
+				os.Exit(0)
+			}
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		exePath, _ := os.Executable()
+		if resolvedExe, err := filepath.EvalSymlinks(exePath); err == nil && resolvedExe != "" {
+			exePath = resolvedExe
+		}
+
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		res, err := system.RunUninstall(ctx, system.UninstallOptions{
+			NodeID:         *nodeID,
+			ControlURL:     *controlURL,
+			AuthToken:      *token,
+			MeshInterface:  *ifaceName,
+			MeshKeyPath:    meshKeyPath,
+			KeepConfig:     *keepConfig,
+			KeepBinary:     *keepBinary,
+			ExecutablePath: exePath,
+			Logger:         logger,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %s failed: %v\n", subCmd, err)
+			os.Exit(1)
+		}
+
+		fmt.Println("================================================================")
+		if *keepBinary {
+			fmt.Println("  ✅ Host cleanly unenrolled from FlareLens (flarelensd leave)")
+		} else {
+			fmt.Println("  ✅ FlareLens Host Agent cleanly uninstalled")
+		}
+		fmt.Println("================================================================")
+		if res.NodeUnenrolled {
+			fmt.Printf("  • Control Plane     : Node %s unenrolled\n", *nodeID)
+		}
+		if res.MeshRevoked {
+			fmt.Println("  • WireGuard Mesh    : Peer deregistered")
+		}
+		if res.ServiceRemoved {
+			fmt.Println("  • Background Daemon : Stopped, disabled & unit removed")
+		}
+		if res.InterfaceRemoved {
+			fmt.Printf("  • Network Overlay   : Interface %s removed\n", cmp.Or(*ifaceName, "flarelens0"))
+		}
+		if res.HostsCleaned {
+			fmt.Println("  • MagicDNS          : /etc/hosts entries cleaned")
+		}
+		fmt.Println("  • Docker Workloads  : Running containers & volumes untouched")
+		for _, w := range res.Warnings {
+			fmt.Fprintf(os.Stderr, "  ⚠️  %s\n", w)
+		}
+		fmt.Println("================================================================")
 		os.Exit(0)
 	}
 

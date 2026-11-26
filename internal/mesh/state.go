@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -123,4 +124,43 @@ func LoadStateFromPath(p string) (*MeshState, error) {
 		return nil, err
 	}
 	return &state, nil
+}
+
+// ClearState removes persisted mesh state files from standard locations and returns removed paths.
+func ClearState(extraPaths ...string) []string {
+	candidates := []string{
+		DefaultStatePath(),
+		"/var/lib/flarelens/mesh-state.json",
+		"/etc/flarelens/mesh-state.json",
+		".flarelens-state.json",
+	}
+	if custom := os.Getenv("FLARELENS_STATE_PATH"); custom != "" {
+		candidates = append(candidates, custom)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, ".flarelens", "mesh-state.json"))
+	}
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+		if usr, err := user.Lookup(sudoUser); err == nil && usr.HomeDir != "" {
+			candidates = append(candidates, filepath.Join(usr.HomeDir, ".flarelens", "mesh-state.json"))
+		}
+	}
+	candidates = append(candidates, extraPaths...)
+
+	seen := make(map[string]struct{}, len(candidates))
+	var removed []string
+	for _, p := range candidates {
+		clean := strings.TrimSpace(p)
+		if clean == "" {
+			continue
+		}
+		if _, exists := seen[clean]; exists {
+			continue
+		}
+		seen[clean] = struct{}{}
+		if err := os.Remove(clean); err == nil {
+			removed = append(removed, clean)
+		}
+	}
+	return removed
 }

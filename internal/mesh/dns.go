@@ -746,6 +746,52 @@ func (s *MagicDNSServer) syncHostsFile(records map[string]net.IP) {
 	_ = os.WriteFile(hostsPath, []byte(b.String()), 0644)
 }
 
+// StripMagicDNSHostsBlock removes the managed FlareLens MagicDNS block from /etc/hosts content.
+func StripMagicDNSHostsBlock(content string) (string, bool) {
+	before, rest, hasStart := strings.Cut(content, MagicDNSHostsHeader)
+	if !hasStart {
+		return content, false
+	}
+	_, after, hasEnd := strings.Cut(rest, MagicDNSHostsFooter)
+	if !hasEnd {
+		return content, false
+	}
+	trimmedBefore := strings.TrimRight(before, " \t\r\n")
+	trimmedAfter := strings.TrimSpace(after)
+	if trimmedBefore == "" && trimmedAfter == "" {
+		return "", true
+	}
+	if trimmedAfter == "" {
+		return trimmedBefore + "\n", true
+	}
+	if trimmedBefore == "" {
+		return trimmedAfter + "\n", true
+	}
+	return trimmedBefore + "\n\n" + trimmedAfter + "\n", true
+}
+
+// CleanHostDNS removes the managed FlareLens block from hostsPath and reverts systemd-resolved for ifaceName.
+func CleanHostDNS(ctx context.Context, ifaceName string, hostsPath string, execFn func(ctx context.Context, cmd string, args ...string) ([]byte, error)) bool {
+	hostsPath = cmp.Or(strings.TrimSpace(hostsPath), "/etc/hosts")
+	modifiedHosts := false
+	if content, err := os.ReadFile(hostsPath); err == nil {
+		if cleaned, changed := StripMagicDNSHostsBlock(string(content)); changed {
+			if writeErr := os.WriteFile(hostsPath, []byte(cleaned), 0644); writeErr == nil {
+				modifiedHosts = true
+			}
+		}
+	}
+
+	if iface := strings.TrimSpace(ifaceName); iface != "" {
+		if execFn != nil {
+			_, _ = execFn(ctx, "resolvectl", "revert", iface)
+		} else if _, err := exec.LookPath("resolvectl"); err == nil {
+			_ = exec.CommandContext(ctx, "resolvectl", "revert", iface).Run()
+		}
+	}
+	return modifiedHosts
+}
+
 // cleanHostsFile strips out the FlareLens block from /etc/hosts
 func (s *MagicDNSServer) cleanHostsFile() {
 	hostsPath := "/etc/hosts"
@@ -753,13 +799,8 @@ func (s *MagicDNSServer) cleanHostsFile() {
 	if err != nil {
 		return
 	}
-
-	str := string(content)
-	if startIdx := strings.Index(str, MagicDNSHostsHeader); startIdx != -1 {
-		if endIdx := strings.Index(str, MagicDNSHostsFooter); endIdx != -1 {
-			cleaned := str[:startIdx] + strings.TrimSpace(str[endIdx+len(MagicDNSHostsFooter):]) + "\n"
-			_ = os.WriteFile(hostsPath, []byte(cleaned), 0644)
-		}
+	if cleaned, changed := StripMagicDNSHostsBlock(string(content)); changed {
+		_ = os.WriteFile(hostsPath, []byte(cleaned), 0644)
 	}
 }
 

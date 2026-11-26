@@ -435,20 +435,28 @@ database:
 ## 🛠️ CLI Usage
 
 ```bash
-# Print agent version and build information
-flarelens-agent --version
+# Print agent version or full command reference
+flarelensd --version
+flarelensd --help
 
 # Run daemon with explicit configuration file
-flarelens-agent --config /etc/flarelens/agent.yaml
+flarelensd --config /etc/flarelens/agent.yaml
 
-# Run in development mode with debug logging
-flarelens-agent --dev --log-level debug
+# Authenticate an operator workstation onto the WireGuard mesh
+sudo flarelensd login --control https://<your-worker-subdomain>.workers.dev
+
+# Temporarily disconnect the local WireGuard tunnel (keeps keys & config)
+sudo flarelensd down
+
+# Revoke workstation mesh peer on Control Plane and remove local mesh state
+sudo flarelensd logout
+
+# Unenroll a server node, remove systemd/launchd/SCM unit & state (keeps Docker apps running)
+sudo flarelensd leave -y
+sudo flarelensd uninstall -y
 
 # Perform an Over-The-Air SHA-256 verified binary upgrade
-sudo flarelens-agent self-update --control https://<your-worker-subdomain>.workers.dev
-
-# Connect to YOUR deployed control plane and specify WireGuard mesh port
-flarelens-agent --control-url https://<your-worker-subdomain>.workers.dev --mesh-port 51820
+sudo flarelensd self-update --control https://<your-worker-subdomain>.workers.dev
 ```
 
 ---
