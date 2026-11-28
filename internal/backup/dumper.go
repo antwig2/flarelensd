@@ -13,6 +13,24 @@ import (
 )
 
 type deployEnvContextKey struct{}
+type containerOverrideContextKey struct{}
+
+// WithContainerName attaches an explicit database container name override (e.g. from manifest `container_name`) to ctx.
+func WithContainerName(ctx context.Context, containerName string) context.Context {
+	trimmed := strings.TrimSpace(containerName)
+	if trimmed == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, containerOverrideContextKey{}, trimmed)
+}
+
+// ContainerNameFromContext retrieves an optional explicit container name override from ctx.
+func ContainerNameFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(containerOverrideContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // WithDeployEnv attaches an optional deployment environment hint (e.g. "uat", "prod") to ctx
 // so multi-environment hosts resolve the matching database container automatically.
@@ -122,6 +140,9 @@ func swapEnvTokenInContainerName(name, targetEnv string) string {
 }
 
 func (d *PostgresDumper) resolveActiveContainer(ctx context.Context, targetDB string) string {
+	if explicit := ContainerNameFromContext(ctx); explicit != "" {
+		return explicit
+	}
 	envHint := DeployEnvFromContext(ctx)
 	candidates := ResolveContainerCandidates(d.serviceName, envHint, targetDB)
 	if len(candidates) <= 1 {

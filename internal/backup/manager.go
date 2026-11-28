@@ -170,6 +170,39 @@ func (m *Manager) ListBackups(ctx context.Context) ([]S3Object, error) {
 	return m.r2Client.ListObjects(ctx, bucket, prefix)
 }
 
+// PruneExpiredBackups deletes R2 snapshots under prefix older than retainDays.
+func (m *Manager) PruneExpiredBackups(ctx context.Context, prefix string, retainDays int) ([]string, error) {
+	if retainDays <= 0 || m.r2Client == nil {
+		return nil, nil
+	}
+	bucket := cmp.Or(m.cfg.Database.Backup.R2Bucket, "flarelens-backups")
+	cleanPrefix := strings.TrimPrefix(strings.TrimSpace(cmp.Or(prefix, m.cfg.Database.Backup.Prefix, "postgres/")), "/")
+	if cleanPrefix != "" && !strings.HasSuffix(cleanPrefix, "/") {
+		cleanPrefix += "/"
+	}
+
+	objs, err := m.r2Client.ListObjects(ctx, bucket, cleanPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Duration(retainDays) * 24 * time.Hour)
+	var pruned []string
+	for _, obj := range objs {
+		if !obj.LastModified.IsZero() && obj.LastModified.Before(cutoff) {
+			if delErr := m.r2Client.DeleteObject(ctx, bucket, obj.Key); delErr != nil {
+				m.logger.Warn("Failed to prune expired R2 snapshot", "key", obj.Key, "error", delErr)
+				continue
+			}
+			pruned = append(pruned, obj.Key)
+		}
+	}
+	if len(pruned) > 0 {
+		m.logger.Info("Pruned expired R2 database snapshots", "prefix", cleanPrefix, "retain_days", retainDays, "deleted_count", len(pruned))
+	}
+	return pruned, nil
+}
+
 // RestoreLatestMatchingTag finds the most recent snapshot matching the given tag and restores it
 func (m *Manager) RestoreLatestMatchingTag(ctx context.Context, tag, targetDB string) error {
 	objs, err := m.ListBackups(ctx)

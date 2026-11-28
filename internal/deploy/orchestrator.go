@@ -82,6 +82,7 @@ type Orchestrator struct {
 	activeSlots        map[string]Slot
 	activePorts        map[string]int
 	funnelRelays       map[string]*funnelBridgeRelay
+	logStreams         map[string]context.CancelFunc
 	nodeID             string
 	activeOps          atomic.Int32
 	lastImagePruneNano atomic.Int64
@@ -124,6 +125,7 @@ func NewOrchestrator(
 		activeSlots:    make(map[string]Slot),
 		activePorts:    make(map[string]int),
 		funnelRelays:   make(map[string]*funnelBridgeRelay),
+		logStreams:     make(map[string]context.CancelFunc),
 		nodeID:         nodeID,
 		migrator:       NewMigrationRunner(logger),
 		pruneCooldown:  6 * time.Hour,

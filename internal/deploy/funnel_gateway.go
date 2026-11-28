@@ -65,7 +65,7 @@ func (o *Orchestrator) SyncFunnelTunnel(ctx context.Context, spec FunnelTunnelSp
 	meshTarget := net.JoinHostPort(targetAddrIP.String(), strconv.Itoa(spec.TargetPort))
 	upstreamURL := "http://" + meshTarget
 
-	// When Traefik runs inside a Docker bridge network (e.g. kiwid-edge / flarelens-edge), bind a host-side
+	// When Traefik runs inside a Docker bridge network (e.g. app-edge / flarelens-edge), bind a host-side
 	// relay on that bridge's gateway IP so Traefik reaches the host's WireGuard flarelens0 interface cleanly
 	// without requiring permissive iptables FORWARD rules between Docker bridges and flarelens0.
 	var bridgeGatewayIP string

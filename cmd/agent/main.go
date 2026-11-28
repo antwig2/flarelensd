@@ -56,6 +56,7 @@ func printCLIUsage() {
 	fmt.Println("  flarelensd logout [flags]           Revoke mesh session, tear down interface & clear state")
 	fmt.Println("  flarelensd status                   Show WireGuard mesh peers, handshakes & transfer stats")
 	fmt.Println("  flarelensd ssh [user@]host.mesh     Open zero-trust SSH session over private mesh")
+	fmt.Println("  flarelensd logs <service> [flags]   Stream live container stdout/stderr without SSH")
 	fmt.Println("  flarelensd http <port> [flags]      Expose localhost port on a public HTTPS URL (ngrok-style Funnel)")
 	fmt.Println("  flarelensd proxy [flags]            Start unprivileged local SOCKS5 / HTTP CONNECT proxy")
 	fmt.Println("  flarelensd backup [flags]           Stream on-demand PostgreSQL backup directly to R2")
@@ -197,6 +198,107 @@ func main() {
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		if err := mesh.RunStatus(context.Background(), logger); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Status error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Subcommand: logs (Stream live container stdout/stderr locally or remotely via Control Plane without SSH)
+	if len(os.Args) > 1 && (os.Args[1] == "logs" || os.Args[1] == "log") {
+		logFlags := flag.NewFlagSet("logs", flag.ExitOnError)
+		follow := logFlags.Bool("f", false, "Follow live log output (docker logs -f)")
+		followLong := logFlags.Bool("follow", false, "Follow live log output (docker logs -f)")
+		tail := logFlags.Int("n", 200, "Number of recent lines to show from the end of the logs")
+		tailLong := logFlags.Int("tail", 200, "Number of recent lines to show from the end of the logs")
+		envName := logFlags.String("env", "", "Environment filter (e.g. uat, prod, infra)")
+		nodeIDFlag := logFlags.String("node", "", "Target server node_id")
+		timestamps := logFlags.Bool("timestamps", false, "Show Docker log timestamps")
+		timestampsShort := logFlags.Bool("t", false, "Show Docker log timestamps")
+		localOnly := logFlags.Bool("local", false, "Read directly from local Docker socket (/var/run/docker.sock)")
+		dockerSock := logFlags.String("docker-socket", "/var/run/docker.sock", "Local Docker socket path")
+		controlURL := logFlags.String("control", os.Getenv("FLARELENS_ENDPOINT"), "Control Plane URL")
+		token := logFlags.String("token", os.Getenv("FLARELENS_ENROLL_TOKEN"), "Control Plane Bearer token")
+
+		boolFlags := map[string]bool{
+			"f": true, "follow": true, "t": true, "timestamps": true, "local": true, "h": true, "help": true,
+		}
+		rawArgs := os.Args[2:]
+		var flagArgs, posArgs []string
+		for i := 0; i < len(rawArgs); i++ {
+			arg := rawArgs[i]
+			if strings.HasPrefix(arg, "-") {
+				flagArgs = append(flagArgs, arg)
+				cleanFlag := strings.TrimLeft(arg, "-")
+				if !strings.Contains(arg, "=") && !boolFlags[cleanFlag] && i+1 < len(rawArgs) {
+					flagArgs = append(flagArgs, rawArgs[i+1])
+					i++
+				}
+			} else {
+				posArgs = append(posArgs, arg)
+			}
+		}
+		_ = logFlags.Parse(append(flagArgs, posArgs...))
+
+		if logFlags.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: flarelensd logs <service|container> [-f|--follow] [-n|--tail 200] [--env uat] [--node id] [--timestamps]")
+			os.Exit(1)
+		}
+		target := logFlags.Arg(0)
+		wantFollow := *follow || *followLong
+		wantTS := *timestamps || *timestampsShort
+		tailLines := *tail
+		if *tailLong != 200 {
+			tailLines = *tailLong
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		// Hydrate control/token from /etc/flarelens/agent.toml if present on a server host
+		if *controlURL == "" || *token == "" {
+			if loadedCfg, err := config.Load(nil); err == nil {
+				*controlURL = cmp.Or(*controlURL, loadedCfg.ControlPlane.Endpoint)
+				*token = cmp.Or(*token, loadedCfg.ControlPlane.EnrollToken)
+			}
+		}
+
+		// Try local Docker Engine directly when --local is set OR when --node is omitted and local socket has the container
+		if *localOnly || *nodeIDFlag == "" {
+			if _, statErr := os.Stat(*dockerSock); statErr == nil {
+				runner := deploy.NewDockerRunner(*dockerSock)
+				orch := deploy.NewOrchestrator(runner, nil, nil, nil, "local", nil)
+				cid, _, resErr := orch.ResolveServiceContainer(ctx, *envName, target)
+				if resErr == nil && cid != "" {
+					if err := runner.StreamContainerLogs(ctx, cid, tailLines, wantFollow, wantTS, func(chunk string) error {
+						_, wErr := io.WriteString(os.Stdout, chunk)
+						return wErr
+					}); err != nil {
+						fmt.Fprintf(os.Stderr, "❌ Local log stream error: %v\n", err)
+						os.Exit(1)
+					}
+					os.Exit(0)
+				}
+				if *localOnly {
+					fmt.Fprintf(os.Stderr, "❌ %v\n", resErr)
+					os.Exit(1)
+				}
+			} else if *localOnly {
+				fmt.Fprintf(os.Stderr, "❌ Docker socket %s not reachable: %v\n", *dockerSock, statErr)
+				os.Exit(1)
+			}
+		}
+
+		if err := mesh.RunRemoteLogsCLI(ctx, mesh.RemoteLogsOptions{
+			Target:     target,
+			Env:        *envName,
+			NodeID:     *nodeIDFlag,
+			TailLines:  tailLines,
+			Follow:     wantFollow,
+			Timestamps: wantTS,
+			ControlURL: *controlURL,
+			AuthToken:  *token,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Logs error: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -709,6 +811,7 @@ func main() {
 	natsClient := transport.NewNATSClient(cfg.NATS.URL, cfg.NATS.AuthToken, logger)
 	deployOrchestrator := deploy.NewOrchestrator(dockerRunner, healthProber, traefikFlipper, natsClient, cfg.Identity.NodeID, logger)
 	defer deployOrchestrator.CloseAllFunnelTunnels()
+	defer deployOrchestrator.CloseAllLogSessions()
 
 	// 6. Initialize Database Backup Engine (Zero-Disk Cloudflare R2 streaming)
 	dumper := backup.NewPostgresDumper(
@@ -1515,6 +1618,12 @@ type NodeCommand struct {
 	TunnelID              string                  `json:"tunnel_id,omitempty"`
 	TargetIP              string                  `json:"target_ip,omitempty"`
 	TargetPort            int                     `json:"target_port,omitzero"`
+	SessionID             string                  `json:"session_id,omitempty"`
+	TailLines             int                     `json:"tail_lines,omitzero"`
+	Follow                bool                    `json:"follow,omitzero"`
+	Timestamps            bool                    `json:"timestamps,omitzero"`
+	Prefix                string                  `json:"prefix,omitempty"`
+	RetainDays            int                     `json:"retain_days,omitzero"`
 	ExtraHosts            []string                `json:"extra_hosts,omitempty"`
 	RemoteUpstreams       []string                `json:"remote_upstreams,omitempty"`
 	ForceRemoveStateful   bool                    `json:"force_remove_stateful,omitzero"`
@@ -1990,6 +2099,53 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 				}
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
+		case "stream_container_logs":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+				if orchestrator == nil || cfg.ControlPlane.Endpoint == "" {
+					return
+				}
+				pushURL := fmt.Sprintf("%s/api/v1/control/containers/logs/push", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"))
+				orchestrator.StreamContainerLogSession(context.Background(), deploy.ContainerLogStreamRequest{
+					SessionID:       cmp.Or(c.SessionID, c.ID),
+					Env:             c.Env,
+					Service:         c.Service,
+					ContainerName:   c.ContainerName,
+					TailLines:       c.TailLines,
+					Follow:          c.Follow,
+					Timestamps:      c.Timestamps,
+					DurationSeconds: c.TimeoutSeconds,
+				}, func(payload deploy.ContainerLogPushPayload) (bool, error) {
+					raw, _ := json.Marshal(payload)
+					req, err := http.NewRequest(http.MethodPost, pushURL, bytes.NewReader(raw))
+					if err != nil {
+						return false, err
+					}
+					req.Header.Set("Content-Type", "application/json")
+					if cfg.ControlPlane.EnrollToken != "" {
+						req.Header.Set("Authorization", "Bearer "+cfg.ControlPlane.EnrollToken)
+					}
+					resp, err := client.Do(req)
+					if err != nil {
+						return false, err
+					}
+					var resBody struct {
+						Stop bool `json:"stop"`
+					}
+					_ = json.NewDecoder(resp.Body).Decode(&resBody)
+					_ = resp.Body.Close()
+					return resBody.Stop, nil
+				})
+			}(cmd)
+		case "stop_container_logs":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator != nil {
+					orchestrator.StopContainerLogSession(c.SessionID)
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
 		case "backup":
 			go func(c NodeCommand) {
 				defer inFlightCommands.Delete(c.ID)
@@ -1999,12 +2155,24 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 				if tag == "" {
 					tag = "manual_ui"
 				}
-				logger.Info("Executing queued database backup...", "tag", tag, "key", c.Key, "command_id", c.ID)
-				meta, err := backupMgr.CreateBackup(context.Background(), tag, c.Key)
+				logger.Info("Executing queued database backup...", "tag", tag, "key", c.Key, "target_db", c.TargetDB, "command_id", c.ID)
+				bkCtx := backup.WithDeployEnv(context.Background(), c.Env)
+				bkCtx = backup.WithContainerName(bkCtx, c.ContainerName)
+				meta, err := backupMgr.CreateBackupForDB(bkCtx, tag, c.TargetDB, c.Key)
+				var prunedKeys []string
+				if err == nil && c.RetainDays > 0 {
+					prunedKeys, _ = backupMgr.PruneExpiredBackups(bkCtx, c.Prefix, c.RetainDays)
+				}
 				statusPayload := map[string]any{
-					"key":     c.Key,
-					"node_id": nodeID,
-					"tag":     tag,
+					"key":       c.Key,
+					"node_id":   nodeID,
+					"tag":       tag,
+					"service":   c.Service,
+					"env":       c.Env,
+					"target_db": c.TargetDB,
+				}
+				if len(prunedKeys) > 0 {
+					statusPayload["pruned_keys"] = prunedKeys
 				}
 				if err != nil {
 					logger.Error("Command backup execution failed", "id", c.ID, "error", err)

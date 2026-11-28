@@ -231,4 +231,57 @@ func TestResolveContainerCandidatesMultiEnv(t *testing.T) {
 	if len(inferred) == 0 || inferred[0] != "postgres-prod" {
 		t.Fatalf("expected inferred candidate 'postgres-prod' from targetDB suffix, got %v", inferred)
 	}
+
+	overrideCtx := WithContainerName(ctx, "explicit-postgres-container")
+	if got := ContainerNameFromContext(overrideCtx); got != "explicit-postgres-container" {
+		t.Fatalf("expected explicit container override, got %q", got)
+	}
+}
+
+func TestPruneExpiredBackupsDeletesOnlyExpiredSnapshots(t *testing.T) {
+	var deletedKeys []string
+	listXML := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>flarelens-backups</Name>
+    <Contents>
+        <Key>postgres/uat/20200101-030000_scheduled.sql.gz</Key>
+        <Size>1024</Size>
+        <LastModified>2020-01-01T03:00:00.000Z</LastModified>
+    </Contents>
+    <Contents>
+        <Key>postgres/uat/20990101-030000_scheduled.sql.gz</Key>
+        <Size>2048</Size>
+        <LastModified>2099-01-01T03:00:00.000Z</LastModified>
+    </Contents>
+</ListBucketResult>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(listXML))
+		case http.MethodDelete:
+			deletedKeys = append(deletedKeys, strings.TrimPrefix(r.URL.Path, "/flarelens-backups/"))
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Database.Backup.R2Bucket = "flarelens-backups"
+	r2 := NewR2Client(srv.URL, "test-key", "test-secret")
+	mgr := NewManager(NewPostgresDumper("host_native", "postgres", "127.0.0.1", 5432, "postgres", "postgres"), r2, nil, cfg, nil)
+
+	pruned, err := mgr.PruneExpiredBackups(t.Context(), "postgres/uat", 14)
+	if err != nil {
+		t.Fatalf("PruneExpiredBackups failed: %v", err)
+	}
+	if len(pruned) != 1 || pruned[0] != "postgres/uat/20200101-030000_scheduled.sql.gz" {
+		t.Fatalf("expected only expired 2020 snapshot pruned, got %v", pruned)
+	}
+	if len(deletedKeys) != 1 || deletedKeys[0] != "postgres/uat/20200101-030000_scheduled.sql.gz" {
+		t.Fatalf("expected DELETE request for expired key, got %v", deletedKeys)
+	}
 }

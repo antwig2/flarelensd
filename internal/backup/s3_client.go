@@ -170,6 +170,31 @@ func (c *R2Client) ListObjects(ctx context.Context, bucket, prefix string) ([]S3
 	return objects, nil
 }
 
+// DeleteObject deletes an object from the R2 bucket using AWS SigV4.
+func (c *R2Client) DeleteObject(ctx context.Context, bucket, key string) error {
+	key = strings.TrimPrefix(key, "/")
+	targetURL := fmt.Sprintf("%s/%s/%s", c.endpoint, bucket, key)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, targetURL, nil)
+	if err != nil {
+		return err
+	}
+
+	c.signRequest(req, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete object in R2: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("r2 delete object failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // AWS SigV4 Signer
 func (c *R2Client) signRequest(req *http.Request, payloadHash string) {
 	now := time.Now().UTC()

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -715,6 +716,127 @@ func (r *DockerRunner) FetchContainerLogs(ctx context.Context, containerID strin
 		return "", err
 	}
 	return demuxDockerLogStream(rawBytes, 32*1024), nil
+}
+
+// StreamContainerLogs streams stdout/stderr chunks from a Docker container (optionally following live output until ctx is canceled),
+// demultiplexing Docker's 8-byte stream frames incrementally while also supporting TTY raw streams.
+func (r *DockerRunner) StreamContainerLogs(
+	ctx context.Context,
+	containerID string,
+	tailLines int,
+	follow bool,
+	timestamps bool,
+	onChunk func(text string) error,
+) error {
+	if strings.HasPrefix(r.socket, "mock") || strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+	tailParam := "200"
+	if tailLines > 0 {
+		tailParam = fmt.Sprintf("%d", tailLines)
+	} else if tailLines < 0 {
+		tailParam = "all"
+	}
+	u := fmt.Sprintf(
+		"http://localhost/containers/%s/logs?stdout=true&stderr=true&tail=%s&follow=%t&timestamps=%t",
+		url.PathEscape(containerID),
+		tailParam,
+		follow,
+		timestamps,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+
+	streamClient := &http.Client{Transport: r.client.Transport}
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("container logs returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var firstHdr [8]byte
+	n, err := io.ReadFull(resp.Body, firstHdr[:])
+	if n == 0 {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+
+	isMultiplexed := n == 8 && firstHdr[0] <= 2 && firstHdr[1] == 0 && firstHdr[2] == 0 && firstHdr[3] == 0
+	if !isMultiplexed {
+		if onChunk != nil {
+			if cbErr := onChunk(string(firstHdr[:n])); cbErr != nil {
+				return cbErr
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		buf := make([]byte, 4096)
+		for {
+			nr, rErr := resp.Body.Read(buf)
+			if nr > 0 && onChunk != nil {
+				if cbErr := onChunk(string(buf[:nr])); cbErr != nil {
+					return cbErr
+				}
+			}
+			if rErr != nil {
+				if errors.Is(rErr, io.EOF) || ctx.Err() != nil {
+					return nil
+				}
+				return rErr
+			}
+		}
+	}
+
+	hdr := firstHdr
+	haveHdr := true
+	chunkBuf := make([]byte, 16*1024)
+
+	for {
+		if !haveHdr {
+			_, hErr := io.ReadFull(resp.Body, hdr[:])
+			if hErr != nil {
+				if errors.Is(hErr, io.EOF) || errors.Is(hErr, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+					return nil
+				}
+				return hErr
+			}
+		}
+		haveHdr = false
+
+		remaining := int(uint32(hdr[4])<<24 | uint32(hdr[5])<<16 | uint32(hdr[6])<<8 | uint32(hdr[7]))
+		for remaining > 0 {
+			step := min(remaining, len(chunkBuf))
+			nr, pErr := io.ReadFull(resp.Body, chunkBuf[:step])
+			if nr > 0 && onChunk != nil {
+				if cbErr := onChunk(string(chunkBuf[:nr])); cbErr != nil {
+					return cbErr
+				}
+			}
+			remaining -= nr
+			if pErr != nil {
+				if errors.Is(pErr, io.EOF) || errors.Is(pErr, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+					return nil
+				}
+				return pErr
+			}
+		}
+	}
 }
 
 func demuxDockerLogStream(raw []byte, maxOut int) string {
