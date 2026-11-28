@@ -417,3 +417,36 @@ func (t *TraefikRouteFlipper) RemoveRoute(service string) error {
 	}
 	return nil
 }
+
+func sanitizeFunnelKey(tunnelID string) string {
+	raw := strings.ToLower(strings.TrimSpace(tunnelID))
+	var b strings.Builder
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	clean := strings.Trim(b.String(), "-")
+	if clean == "" {
+		return "default"
+	}
+	return clean
+}
+
+// WriteFunnelRoute atomically creates or updates an ephemeral developer localhost tunnel route (`funnel-<id>.yaml`).
+func (t *TraefikRouteFlipper) WriteFunnelRoute(tunnelID, domain, upstreamURL string) error {
+	cleanDomain := strings.TrimSpace(domain)
+	if cleanDomain == "" || strings.TrimSpace(upstreamURL) == "" {
+		return fmt.Errorf("funnel route requires non-empty domain and upstreamURL")
+	}
+	key := "funnel-" + sanitizeFunnelKey(tunnelID)
+	return t.flipRouteURLWithDomains(key, []string{cleanDomain}, strings.TrimSpace(upstreamURL))
+}
+
+// RemoveFunnelRoute removes an ephemeral developer localhost tunnel route (`funnel-<id>.yaml`).
+func (t *TraefikRouteFlipper) RemoveFunnelRoute(tunnelID string) error {
+	key := "funnel-" + sanitizeFunnelKey(tunnelID)
+	return t.RemoveRoute(key)
+}

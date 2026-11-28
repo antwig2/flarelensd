@@ -56,6 +56,7 @@ func printCLIUsage() {
 	fmt.Println("  flarelensd logout [flags]           Revoke mesh session, tear down interface & clear state")
 	fmt.Println("  flarelensd status                   Show WireGuard mesh peers, handshakes & transfer stats")
 	fmt.Println("  flarelensd ssh [user@]host.mesh     Open zero-trust SSH session over private mesh")
+	fmt.Println("  flarelensd http <port> [flags]      Expose localhost port on a public HTTPS URL (ngrok-style Funnel)")
 	fmt.Println("  flarelensd proxy [flags]            Start unprivileged local SOCKS5 / HTTP CONNECT proxy")
 	fmt.Println("  flarelensd backup [flags]           Stream on-demand PostgreSQL backup directly to R2")
 	fmt.Println("  flarelensd self-update [flags]      Atomically upgrade flarelensd with SHA-256 verification")
@@ -196,6 +197,71 @@ func main() {
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		if err := mesh.RunStatus(context.Background(), logger); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Status error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Subcommand: http / tunnel / funnel (Expose localhost port on a public HTTPS URL via WireGuard + Traefik)
+	if len(os.Args) > 1 && (os.Args[1] == "http" || os.Args[1] == "tunnel" || os.Args[1] == "funnel") {
+		httpFlags := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
+		subdomain := httpFlags.String("subdomain", "", "Requested public subdomain slug (e.g. billing-webhook)")
+		domain := httpFlags.String("domain", "", "Explicit full public domain (e.g. webhook-dev.example.com)")
+		basicAuth := httpFlags.String("auth", "", "Optional HTTP Basic Auth guard in username:password format")
+		hostHeader := httpFlags.String("host-header", "rewrite", "Host header mode: 'rewrite' (localhost:<port>), 'preserve', or custom host")
+		gatewayNode := httpFlags.String("node", "", "Optional gateway node_id override")
+		controlURL := httpFlags.String("control", os.Getenv("FLARELENS_ENDPOINT"), "Optional Control Plane URL override")
+		token := httpFlags.String("token", os.Getenv("FLARELENS_ENROLL_TOKEN"), "Optional Control Plane Bearer token")
+		overlayIP := httpFlags.String("overlay-ip", "", "Optional local WireGuard overlay IP override")
+		meshPort := httpFlags.Int("mesh-port", 0, "Optional explicit WireGuard listener port (default: ephemeral)")
+		quiet := httpFlags.Bool("quiet", false, "Suppress per-request access log lines")
+
+		// Reorder positional port argument (e.g. `flarelensd http 3000 --subdomain dev`) so flag.Parse sees all flags
+		rawArgs := os.Args[2:]
+		var flagArgs, posArgs []string
+		for i := 0; i < len(rawArgs); i++ {
+			arg := rawArgs[i]
+			if strings.HasPrefix(arg, "-") {
+				flagArgs = append(flagArgs, arg)
+				cleanFlag := strings.TrimLeft(arg, "-")
+				if !strings.Contains(arg, "=") && cleanFlag != "quiet" && cleanFlag != "h" && cleanFlag != "help" && i+1 < len(rawArgs) {
+					flagArgs = append(flagArgs, rawArgs[i+1])
+					i++
+				}
+			} else {
+				posArgs = append(posArgs, arg)
+			}
+		}
+		_ = httpFlags.Parse(append(flagArgs, posArgs...))
+
+		if httpFlags.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: flarelensd http <port|host:port> [--subdomain name] [--domain fqdn] [--auth user:pass]")
+			os.Exit(1)
+		}
+		localHost, localPort, err := mesh.ParseFunnelTarget(httpFlags.Arg(0))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		if err := mesh.RunFunnel(ctx, mesh.FunnelOptions{
+			LocalHost:   localHost,
+			LocalPort:   localPort,
+			ListenIP:    *overlayIP,
+			ListenPort:  *meshPort,
+			Subdomain:   *subdomain,
+			Domain:      *domain,
+			BasicAuth:   *basicAuth,
+			HostHeader:  *hostHeader,
+			GatewayNode: *gatewayNode,
+			ControlURL:  *controlURL,
+			AuthToken:   *token,
+			Quiet:       *quiet,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Funnel error: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -642,6 +708,7 @@ func main() {
 	// 5. Connect to NATS Event Fabric (Embedded or Client mode)
 	natsClient := transport.NewNATSClient(cfg.NATS.URL, cfg.NATS.AuthToken, logger)
 	deployOrchestrator := deploy.NewOrchestrator(dockerRunner, healthProber, traefikFlipper, natsClient, cfg.Identity.NodeID, logger)
+	defer deployOrchestrator.CloseAllFunnelTunnels()
 
 	// 6. Initialize Database Backup Engine (Zero-Disk Cloudflare R2 streaming)
 	dumper := backup.NewPostgresDumper(
@@ -1445,6 +1512,9 @@ type NodeCommand struct {
 	RunID                 string                  `json:"run_id,omitempty"`
 	JobName               string                  `json:"job_name,omitempty"`
 	Trigger               string                  `json:"trigger,omitempty"`
+	TunnelID              string                  `json:"tunnel_id,omitempty"`
+	TargetIP              string                  `json:"target_ip,omitempty"`
+	TargetPort            int                     `json:"target_port,omitzero"`
 	ExtraHosts            []string                `json:"extra_hosts,omitempty"`
 	RemoteUpstreams       []string                `json:"remote_upstreams,omitempty"`
 	ForceRemoveStateful   bool                    `json:"force_remove_stateful,omitzero"`
@@ -1894,6 +1964,30 @@ func dispatchNodeCommands(cmds []NodeCommand, client *http.Client, backupMgr *ba
 					NodeID:         nodeID,
 				}
 				executeContainerJob(orchestrator, jReq, "", nil, nodeID, cfg, logger)
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+		case "sync_tunnel":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator != nil {
+					_, err := orchestrator.SyncFunnelTunnel(context.Background(), deploy.FunnelTunnelSpec{
+						TunnelID:   c.TunnelID,
+						Domain:     c.Domain,
+						TargetIP:   c.TargetIP,
+						TargetPort: c.TargetPort,
+					})
+					if err != nil {
+						logger.Warn("Failed to sync Funnel tunnel route", "tunnel_id", c.TunnelID, "domain", c.Domain, "error", err)
+					}
+				}
+				ackCommand(cfg, client, c.ID, nodeID, logger)
+			}(cmd)
+		case "remove_tunnel":
+			go func(c NodeCommand) {
+				defer inFlightCommands.Delete(c.ID)
+				if orchestrator != nil {
+					orchestrator.RemoveFunnelTunnel(c.TunnelID)
+				}
 				ackCommand(cfg, client, c.ID, nodeID, logger)
 			}(cmd)
 		case "backup":

@@ -1147,6 +1147,89 @@ func (r *DockerRunner) DiscoverTraefikRoutesDir(ctx context.Context) string {
 	return ""
 }
 
+// DiscoverTraefikBridgeGatewayIP inspects running Traefik containers and returns the host-side Docker bridge gateway IP
+// (e.g. "172.18.0.1") when Traefik runs on a bridge network, or "" when Traefik runs on host networking or is absent.
+func (r *DockerRunner) DiscoverTraefikBridgeGatewayIP(ctx context.Context) string {
+	if strings.HasPrefix(r.socket, "mock") {
+		return ""
+	}
+	containers, err := r.ListRunningContainers(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, c := range containers {
+		isTraefik := strings.Contains(strings.ToLower(c.Image), "traefik")
+		if !isTraefik {
+			for _, n := range c.Names {
+				if strings.Contains(strings.ToLower(n), "traefik") {
+					isTraefik = true
+					break
+				}
+			}
+		}
+		if !isTraefik {
+			continue
+		}
+		if _, onHost := c.Networks["host"]; onHost {
+			return ""
+		}
+		netNames := slices.Sorted(maps.Keys(c.Networks))
+		// Prefer *-edge network first if present
+		slices.SortFunc(netNames, func(a, b string) int {
+			aEdge := strings.HasSuffix(a, "edge")
+			bEdge := strings.HasSuffix(b, "edge")
+			if aEdge != bEdge {
+				if aEdge {
+					return -1
+				}
+				return 1
+			}
+			return cmp.Compare(a, b)
+		})
+		for _, netName := range netNames {
+			if netName == "" || netName == "host" || netName == "none" {
+				continue
+			}
+			if gw := r.inspectNetworkGateway(ctx, netName); gw != "" {
+				return gw
+			}
+		}
+	}
+	return ""
+}
+
+func (r *DockerRunner) inspectNetworkGateway(ctx context.Context, networkName string) string {
+	u := fmt.Sprintf("http://localhost/networks/%s", url.PathEscape(networkName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var netData struct {
+		IPAM struct {
+			Config []struct {
+				Gateway string `json:"Gateway"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&netData); err != nil {
+		return ""
+	}
+	for _, cfg := range netData.IPAM.Config {
+		if gw := strings.TrimSpace(cfg.Gateway); gw != "" {
+			return gw
+		}
+	}
+	return ""
+}
+
 func isExistingDir(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
