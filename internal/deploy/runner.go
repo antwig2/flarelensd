@@ -1272,12 +1272,19 @@ func (r *DockerRunner) DiscoverTraefikRoutesDir(ctx context.Context) string {
 // DiscoverTraefikBridgeGatewayIP inspects running Traefik containers and returns the host-side Docker bridge gateway IP
 // (e.g. "172.18.0.1") when Traefik runs on a bridge network, or "" when Traefik runs on host networking or is absent.
 func (r *DockerRunner) DiscoverTraefikBridgeGatewayIP(ctx context.Context) string {
+	gw, _ := r.DiscoverTraefikBridgeNetwork(ctx)
+	return gw
+}
+
+// DiscoverTraefikBridgeNetwork inspects running Traefik containers and returns the host-side Docker bridge
+// gateway IP and subnet CIDR (e.g. "172.18.0.1", "172.18.0.0/16") when Traefik runs on a bridge network.
+func (r *DockerRunner) DiscoverTraefikBridgeNetwork(ctx context.Context) (string, string) {
 	if strings.HasPrefix(r.socket, "mock") {
-		return ""
+		return "", ""
 	}
 	containers, err := r.ListRunningContainers(ctx)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	for _, c := range containers {
 		isTraefik := strings.Contains(strings.ToLower(c.Image), "traefik")
@@ -1293,7 +1300,7 @@ func (r *DockerRunner) DiscoverTraefikBridgeGatewayIP(ctx context.Context) strin
 			continue
 		}
 		if _, onHost := c.Networks["host"]; onHost {
-			return ""
+			return "", ""
 		}
 		netNames := slices.Sorted(maps.Keys(c.Networks))
 		// Prefer *-edge network first if present
@@ -1312,44 +1319,45 @@ func (r *DockerRunner) DiscoverTraefikBridgeGatewayIP(ctx context.Context) strin
 			if netName == "" || netName == "host" || netName == "none" {
 				continue
 			}
-			if gw := r.inspectNetworkGateway(ctx, netName); gw != "" {
-				return gw
+			if gw, subnet := r.inspectNetworkIPAM(ctx, netName); gw != "" {
+				return gw, subnet
 			}
 		}
 	}
-	return ""
+	return "", ""
 }
 
-func (r *DockerRunner) inspectNetworkGateway(ctx context.Context, networkName string) string {
+func (r *DockerRunner) inspectNetworkIPAM(ctx context.Context, networkName string) (string, string) {
 	u := fmt.Sprintf("http://localhost/networks/%s", url.PathEscape(networkName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return "", ""
 	}
 	var netData struct {
 		IPAM struct {
 			Config []struct {
+				Subnet  string `json:"Subnet"`
 				Gateway string `json:"Gateway"`
 			} `json:"Config"`
 		} `json:"IPAM"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&netData); err != nil {
-		return ""
+		return "", ""
 	}
 	for _, cfg := range netData.IPAM.Config {
 		if gw := strings.TrimSpace(cfg.Gateway); gw != "" {
-			return gw
+			return gw, strings.TrimSpace(cfg.Subnet)
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func isExistingDir(path string) bool {

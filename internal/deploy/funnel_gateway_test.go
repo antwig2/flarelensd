@@ -63,7 +63,7 @@ func TestSyncAndRemoveFunnelTunnel(t *testing.T) {
 	u, _ := url.Parse(backend.URL)
 	_, portStr, _ := net.SplitHostPort(u.Host)
 	portNum, _ := strconv.Atoi(portStr)
-	relay, err := startFunnelBridgeRelay("tun_relay", "127.0.0.1", net.JoinHostPort("127.0.0.1", strconv.Itoa(portNum)))
+	relay, err := startFunnelBridgeRelay("tun_relay", "127.0.0.1", "127.0.0.0/8", net.JoinHostPort("127.0.0.1", strconv.Itoa(portNum)))
 	if err != nil {
 		t.Fatalf("startFunnelBridgeRelay: %v", err)
 	}

@@ -7,6 +7,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,11 +26,12 @@ type FunnelTunnelSpec struct {
 }
 
 type funnelBridgeRelay struct {
-	tunnelID   string
-	targetAddr string
-	listenAddr string
-	ln         net.Listener
-	cancel     context.CancelFunc
+	tunnelID        string
+	targetAddr      string
+	listenAddr      string
+	ln              net.Listener
+	cancel          context.CancelFunc
+	cleanupFirewall func()
 }
 
 func (r *funnelBridgeRelay) close() {
@@ -39,6 +43,10 @@ func (r *funnelBridgeRelay) close() {
 	}
 	if r.ln != nil {
 		_ = r.ln.Close()
+	}
+	if r.cleanupFirewall != nil {
+		r.cleanupFirewall()
+		r.cleanupFirewall = nil
 	}
 }
 
@@ -68,9 +76,9 @@ func (o *Orchestrator) SyncFunnelTunnel(ctx context.Context, spec FunnelTunnelSp
 	// When Traefik runs inside a Docker bridge network (e.g. app-edge / flarelens-edge), bind a host-side
 	// relay on that bridge's gateway IP so Traefik reaches the host's WireGuard flarelens0 interface cleanly
 	// without requiring permissive iptables FORWARD rules between Docker bridges and flarelens0.
-	var bridgeGatewayIP string
+	var bridgeGatewayIP, bridgeSubnet string
 	if o.runner != nil {
-		bridgeGatewayIP = o.runner.DiscoverTraefikBridgeGatewayIP(ctx)
+		bridgeGatewayIP, bridgeSubnet = o.runner.DiscoverTraefikBridgeNetwork(ctx)
 	}
 
 	o.mu.Lock()
@@ -95,7 +103,7 @@ func (o *Orchestrator) SyncFunnelTunnel(ctx context.Context, spec FunnelTunnelSp
 	o.mu.Unlock()
 
 	if bridgeGatewayIP != "" {
-		if relay, relayErr := startFunnelBridgeRelay(tunnelID, bridgeGatewayIP, meshTarget); relayErr == nil {
+		if relay, relayErr := startFunnelBridgeRelay(tunnelID, bridgeGatewayIP, bridgeSubnet, meshTarget); relayErr == nil {
 			o.mu.Lock()
 			o.funnelRelays[tunnelID] = relay
 			o.mu.Unlock()
@@ -146,18 +154,22 @@ func (o *Orchestrator) CloseAllFunnelTunnels() {
 	}
 }
 
-func startFunnelBridgeRelay(tunnelID, bindIP, targetAddr string) (*funnelBridgeRelay, error) {
+func startFunnelBridgeRelay(tunnelID, bindIP, bridgeSubnet, targetAddr string) (*funnelBridgeRelay, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(bindIP, "0"))
 	if err != nil {
 		return nil, err
 	}
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	cleanupFW := allowDockerBridgeRelayPort(bindIP, bridgeSubnet, portStr)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &funnelBridgeRelay{
-		tunnelID:   tunnelID,
-		targetAddr: targetAddr,
-		listenAddr: ln.Addr().String(),
-		ln:         ln,
-		cancel:     cancel,
+		tunnelID:        tunnelID,
+		targetAddr:      targetAddr,
+		listenAddr:      ln.Addr().String(),
+		ln:              ln,
+		cancel:          cancel,
+		cleanupFirewall: cleanupFW,
 	}
 
 	go func() {
@@ -173,6 +185,42 @@ func startFunnelBridgeRelay(tunnelID, bindIP, targetAddr string) (*funnelBridgeR
 		}
 	}()
 	return r, nil
+}
+
+// allowDockerBridgeRelayPort inserts a tightly-scoped iptables INPUT rule so Traefik running inside a
+// Docker bridge container can reach the host bridge gateway listener even when `ufw default deny incoming` is active.
+func allowDockerBridgeRelayPort(bindIP, bridgeSubnet, portStr string) func() {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return nil
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(bindIP))
+	if err != nil || addr.IsLoopback() || !addr.Is4() {
+		return nil
+	}
+	portNum, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return nil
+	}
+
+	var ruleSpec []string
+	if prefix, pErr := netip.ParsePrefix(strings.TrimSpace(bridgeSubnet)); pErr == nil && prefix.Addr().Is4() {
+		ruleSpec = []string{"-s", prefix.Masked().String(), "-d", addr.String() + "/32", "-p", "tcp", "--dport", strconv.Itoa(portNum), "-j", "ACCEPT"}
+	} else {
+		ruleSpec = []string{"-d", addr.String() + "/32", "-p", "tcp", "--dport", strconv.Itoa(portNum), "!", "-i", "eth+", "-j", "ACCEPT"}
+	}
+
+	checkArgs := append([]string{"-C", "INPUT"}, ruleSpec...)
+	if exec.Command("iptables", checkArgs...).Run() != nil {
+		insertArgs := append([]string{"-I", "INPUT", "1"}, ruleSpec...)
+		if exec.Command("iptables", insertArgs...).Run() != nil {
+			return nil
+		}
+	}
+
+	return func() {
+		delArgs := append([]string{"-D", "INPUT"}, ruleSpec...)
+		_ = exec.Command("iptables", delArgs...).Run()
+	}
 }
 
 func pipeFunnelConn(ctx context.Context, src net.Conn, targetAddr string) {

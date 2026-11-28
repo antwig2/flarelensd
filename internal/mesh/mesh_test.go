@@ -2,6 +2,8 @@ package mesh
 
 import (
 	"context"
+	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -102,11 +104,11 @@ func TestInitInterfaceAndSyncPeers(t *testing.T) {
 		t.Fatalf("SyncPeers failed: %v", err)
 	}
 
-	if !mockCtrl.lastConfig.ReplacePeers {
-		t.Errorf("Expected ReplacePeers=true in native Netlink sync")
+	if mockCtrl.lastConfig.ReplacePeers {
+		t.Errorf("Expected ReplacePeers=false in differential Netlink sync to preserve active handshakes")
 	}
 	if len(mockCtrl.lastConfig.Peers) != 2 {
-		t.Fatalf("Expected 2 peers in native Netlink sync, got %d", len(mockCtrl.lastConfig.Peers))
+		t.Fatalf("Expected 2 peers in initial Netlink sync, got %d", len(mockCtrl.lastConfig.Peers))
 	}
 }
 
@@ -171,12 +173,53 @@ func int64ToString(n int64) string {
 type mockWGController struct {
 	configuredDevice string
 	lastConfig       wgtypes.Config
+	configureCalls   int
 	device           *wgtypes.Device
 }
 
 func (m *mockWGController) ConfigureDevice(name string, cfg wgtypes.Config) error {
 	m.configuredDevice = name
 	m.lastConfig = cfg
+	m.configureCalls++
+	if m.device == nil {
+		m.device = &wgtypes.Device{Name: name}
+	}
+	if cfg.ReplacePeers {
+		m.device.Peers = nil
+	}
+	for _, pc := range cfg.Peers {
+		idx := slices.IndexFunc(m.device.Peers, func(existing wgtypes.Peer) bool {
+			return existing.PublicKey == pc.PublicKey
+		})
+		if pc.Remove {
+			if idx >= 0 {
+				m.device.Peers = slices.Delete(m.device.Peers, idx, idx+1)
+			}
+			continue
+		}
+		var peer wgtypes.Peer
+		if idx >= 0 {
+			peer = m.device.Peers[idx]
+		} else {
+			peer = wgtypes.Peer{PublicKey: pc.PublicKey}
+		}
+		if pc.Endpoint != nil {
+			peer.Endpoint = pc.Endpoint
+		}
+		if pc.PersistentKeepaliveInterval != nil {
+			peer.PersistentKeepaliveInterval = *pc.PersistentKeepaliveInterval
+		}
+		if pc.ReplaceAllowedIPs {
+			peer.AllowedIPs = slices.Clone(pc.AllowedIPs)
+		} else {
+			peer.AllowedIPs = append(peer.AllowedIPs, pc.AllowedIPs...)
+		}
+		if idx >= 0 {
+			m.device.Peers[idx] = peer
+		} else {
+			m.device.Peers = append(m.device.Peers, peer)
+		}
+	}
 	return nil
 }
 
@@ -208,7 +251,7 @@ func TestNativeWGControllerSync(t *testing.T) {
 	mgr := NewManager(cfg, priv, pub, mockExec, nil)
 	mgr.SetWGController(mockCtrl)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := mgr.InitInterface(ctx); err != nil {
 		t.Fatalf("InitInterface with native controller failed: %v", err)
 	}
@@ -221,6 +264,7 @@ func TestNativeWGControllerSync(t *testing.T) {
 	}
 
 	_, peerPub, _ := GenerateKeypair()
+	_, clientPub, _ := GenerateKeypair()
 	peers := []Peer{
 		{
 			ID:        "peer-node",
@@ -229,19 +273,59 @@ func TestNativeWGControllerSync(t *testing.T) {
 			OverlayIP: "100.64.0.2",
 			Endpoint:  "198.51.100.1:51820",
 		},
+		{
+			ID:        "client-laptop",
+			Name:      "laptop",
+			PublicKey: clientPub,
+			OverlayIP: "100.64.0.100",
+			Type:      "client",
+		},
 	}
 
 	if err := mgr.SyncPeers(ctx, peers); err != nil {
 		t.Fatalf("SyncPeers with native controller failed: %v", err)
 	}
 
-	if !mockCtrl.lastConfig.ReplacePeers {
-		t.Errorf("Expected ReplacePeers to be true in native peer sync")
+	if mockCtrl.lastConfig.ReplacePeers {
+		t.Errorf("Expected ReplacePeers to be false in differential native peer sync")
 	}
-	if len(mockCtrl.lastConfig.Peers) != 1 {
-		t.Fatalf("Expected 1 peer configured natively, got %d", len(mockCtrl.lastConfig.Peers))
+	if len(mockCtrl.lastConfig.Peers) != 2 {
+		t.Fatalf("Expected 2 peers configured natively, got %d", len(mockCtrl.lastConfig.Peers))
 	}
-	if mockCtrl.lastConfig.Peers[0].PublicKey.String() != peerPub {
-		t.Errorf("Expected configured peer public key %s, got %s", peerPub, mockCtrl.lastConfig.Peers[0].PublicKey.String())
+
+	// Simulate kernel learning dynamic NAT endpoint for roaming client laptop after handshake
+	learnedNAT, _ := net.ResolveUDPAddr("udp", "203.0.113.45:59123")
+	for i := range mockCtrl.device.Peers {
+		if mockCtrl.device.Peers[i].PublicKey.String() == clientPub {
+			mockCtrl.device.Peers[i].Endpoint = learnedNAT
+		}
+	}
+
+	// Subsequent 15s heartbeat sync with unchanged peers must NOT call ConfigureDevice or wipe learned NAT endpoint
+	callsBefore := mockCtrl.configureCalls
+	if err := mgr.SyncPeers(ctx, peers); err != nil {
+		t.Fatalf("idempotent SyncPeers failed: %v", err)
+	}
+	if mockCtrl.configureCalls != callsBefore {
+		t.Fatalf("expected zero ConfigureDevice calls when peers are unchanged, got %d -> %d", callsBefore, mockCtrl.configureCalls)
+	}
+	for _, kp := range mockCtrl.device.Peers {
+		if kp.PublicKey.String() == clientPub && (kp.Endpoint == nil || kp.Endpoint.String() != "203.0.113.45:59123") {
+			t.Fatalf("expected roaming client NAT endpoint to be preserved, got %v", kp.Endpoint)
+		}
+	}
+
+	// Removing the client peer issues a targeted Remove=true without ReplacePeers=true
+	if err := mgr.SyncPeers(ctx, peers[:1]); err != nil {
+		t.Fatalf("SyncPeers removal failed: %v", err)
+	}
+	if mockCtrl.lastConfig.ReplacePeers {
+		t.Fatalf("expected ReplacePeers=false when removing stale peer")
+	}
+	if len(mockCtrl.lastConfig.Peers) != 1 || !mockCtrl.lastConfig.Peers[0].Remove || mockCtrl.lastConfig.Peers[0].PublicKey.String() != clientPub {
+		t.Fatalf("expected targeted Remove=true for %s, got %+v", clientPub, mockCtrl.lastConfig.Peers)
+	}
+	if len(mockCtrl.device.Peers) != 1 || mockCtrl.device.Peers[0].PublicKey.String() != peerPub {
+		t.Fatalf("expected node peer to remain intact after client removal, got %+v", mockCtrl.device.Peers)
 	}
 }

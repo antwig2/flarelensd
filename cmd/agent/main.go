@@ -40,7 +40,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.11"
+	Version = "0.2.13"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"
@@ -1664,6 +1664,11 @@ func configureControlPlaneSync(
 		"initial_flags_synced", initialFlagsSynced,
 	)
 
+	// Rehydrate any active public Funnel tunnels assigned to this gateway node across agent restarts / OTA updates
+	if orchestrator != nil {
+		go rehydrateActiveFunnelTunnels(ctx, client, orchestrator, cfg, nodeID, logger)
+	}
+
 	reporter.SetClusterSyncHandler(func(hbCtx context.Context, overlayIP string, rawPeers json.RawMessage, rawEndpoints json.RawMessage) {
 		effectiveIP := overlayIP
 		if effectiveIP == "" && meshMgr != nil {
@@ -2523,6 +2528,64 @@ func startAutoImagePruneLoop(ctx context.Context, orchestrator *deploy.Orchestra
 			return
 		case <-ticker.C:
 			orchestrator.MaybeAutoPruneImages(ctx)
+		}
+	}
+}
+
+func rehydrateActiveFunnelTunnels(
+	ctx context.Context,
+	client *http.Client,
+	orchestrator *deploy.Orchestrator,
+	cfg *config.Config,
+	nodeID string,
+	logger *slog.Logger,
+) {
+	if orchestrator == nil || cfg == nil || cfg.ControlPlane.Endpoint == "" {
+		return
+	}
+	reqURL := fmt.Sprintf("%s/api/v1/control/tunnels", strings.TrimRight(cfg.ControlPlane.Endpoint, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return
+	}
+	if cfg.ControlPlane.EnrollToken != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.ControlPlane.EnrollToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var payload struct {
+		Tunnels []struct {
+			TunnelID   string `json:"tunnel_id"`
+			NodeID     string `json:"node_id"`
+			Domain     string `json:"domain"`
+			TargetIP   string `json:"target_ip"`
+			TargetPort int    `json:"target_port"`
+		} `json:"tunnels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return
+	}
+	for _, t := range payload.Tunnels {
+		if t.TunnelID == "" || t.Domain == "" || t.TargetIP == "" || t.TargetPort < 1 {
+			continue
+		}
+		if t.NodeID != "" && t.NodeID != nodeID {
+			continue
+		}
+		if _, syncErr := orchestrator.SyncFunnelTunnel(ctx, deploy.FunnelTunnelSpec{
+			TunnelID:   t.TunnelID,
+			Domain:     t.Domain,
+			TargetIP:   t.TargetIP,
+			TargetPort: t.TargetPort,
+		}); syncErr != nil {
+			logger.Warn("Startup Funnel tunnel rehydration warning", "tunnel_id", t.TunnelID, "domain", t.Domain, "error", syncErr)
 		}
 	}
 }

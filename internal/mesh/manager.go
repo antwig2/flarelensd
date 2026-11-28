@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,17 +169,53 @@ func (m *Manager) InitInterface(ctx context.Context) error {
 		return fmt.Errorf("failed to bring up interface %s: %s (%w)", iface, strings.TrimSpace(string(out)), err)
 	}
 
+	// 5. Ensure host firewall (e.g. UFW default deny incoming) permits authenticated WireGuard overlay traffic on flarelens0
+	if _, chkErr := m.executor.Run(ctx, "iptables", "-C", "INPUT", "-i", iface, "-j", "ACCEPT"); chkErr != nil {
+		_, _ = m.executor.Run(ctx, "iptables", "-I", "INPUT", "1", "-i", iface, "-j", "ACCEPT")
+	}
+
 	m.logger.Info("FlareLens WireGuard mesh interface is UP", "interface", iface, "overlay_ip", m.cfg.OverlayIP)
 	return nil
 }
 
+func allowedNetsEqual(a, b []net.IPNet) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := make([]string, len(a))
+	bs := make([]string, len(b))
+	for i := range a {
+		as[i] = a[i].String()
+		bs[i] = b[i].String()
+	}
+	slices.Sort(as)
+	slices.Sort(bs)
+	return slices.Equal(as, bs)
+}
+
 // SyncPeers dynamically adds, updates, or removes peers in the kernel without restarting the interface
+// or destroying active WireGuard handshake sessions and learned roaming NAT endpoints.
 func (m *Manager) SyncPeers(ctx context.Context, peers []Peer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	iface := m.cfg.InterfaceName
+	c, cleanup, err := m.getWGClient()
+	if err != nil {
+		return fmt.Errorf("failed to open wireguard netlink client: %w", err)
+	}
+	defer cleanup()
+
+	kernelPeers := make(map[string]wgtypes.Peer)
+	if dev, devErr := c.Device(iface); devErr == nil && dev != nil {
+		for _, kp := range dev.Peers {
+			kernelPeers[kp.PublicKey.String()] = kp
+		}
+	}
+
 	newPeerMap := make(map[string]Peer)
+	desiredNetsByKey := make(map[string][]net.IPNet)
+	desiredRoutes := make(map[string]struct{})
 	var peerConfigs []wgtypes.PeerConfig
 
 	for _, p := range peers {
@@ -186,7 +223,6 @@ func (m *Manager) SyncPeers(ctx context.Context, peers []Peer) error {
 		if p.PublicKey == m.pubKey || p.OverlayIP == "" {
 			continue
 		}
-		newPeerMap[p.PublicKey] = p
 
 		pubKey, err := wgtypes.ParseKey(p.PublicKey)
 		if err != nil {
@@ -221,47 +257,103 @@ func (m *Manager) SyncPeers(ctx context.Context, peers []Peer) error {
 			continue
 		}
 
-		keepalive := 25 * time.Second
-		pc := wgtypes.PeerConfig{
-			PublicKey:                   pubKey,
-			AllowedIPs:                  allowedNets,
-			PersistentKeepaliveInterval: &keepalive,
-			ReplaceAllowedIPs:           true,
+		newPeerMap[p.PublicKey] = p
+		desiredNetsByKey[p.PublicKey] = allowedNets
+		for _, an := range allowedNets {
+			desiredRoutes[an.String()] = struct{}{}
 		}
 
-		if p.Endpoint != "" {
-			if udpAddr, err := net.ResolveUDPAddr("udp", p.Endpoint); err == nil {
-				pc.Endpoint = udpAddr
+		var udpAddr *net.UDPAddr
+		if trimmedEp := strings.TrimSpace(p.Endpoint); trimmedEp != "" {
+			if resolved, resolveErr := net.ResolveUDPAddr("udp", trimmedEp); resolveErr == nil {
+				udpAddr = resolved
 			}
 		}
 
+		kp, exists := kernelPeers[p.PublicKey]
+		const wantKeepalive = 25 * time.Second
+		sameAllowed := exists && allowedNetsEqual(kp.AllowedIPs, allowedNets)
+		sameKeepalive := exists && kp.PersistentKeepaliveInterval == wantKeepalive
+		sameEndpoint := exists && (udpAddr == nil || (kp.Endpoint != nil && kp.Endpoint.String() == udpAddr.String()))
+
+		if sameAllowed && sameKeepalive && sameEndpoint {
+			continue
+		}
+
+		pc := wgtypes.PeerConfig{
+			PublicKey:                   pubKey,
+			UpdateOnly:                  exists,
+			AllowedIPs:                  allowedNets,
+			PersistentKeepaliveInterval: new(wantKeepalive),
+			ReplaceAllowedIPs:           true,
+		}
+		if udpAddr != nil && (!exists || kp.Endpoint == nil || kp.Endpoint.String() != udpAddr.String()) {
+			pc.Endpoint = udpAddr
+		}
 		peerConfigs = append(peerConfigs, pc)
 	}
 
-	// Atomic peer sync via native Netlink wgctrl
-	c, cleanup, err := m.getWGClient()
-	if err != nil {
-		return fmt.Errorf("failed to open wireguard netlink client: %w", err)
+	// Remove peers that were revoked or unenrolled since the previous sync
+	staleKeys := make(map[string]struct{})
+	for pubStr := range kernelPeers {
+		if _, keep := newPeerMap[pubStr]; !keep {
+			staleKeys[pubStr] = struct{}{}
+		}
 	}
-	defer cleanup()
-
-	cfg := wgtypes.Config{
-		ReplacePeers: true,
-		Peers:        peerConfigs,
-	}
-	if err := c.ConfigureDevice(iface, cfg); err != nil {
-		return fmt.Errorf("failed to sync wireguard peers via netlink: %w", err)
+	for pubStr := range m.knownPeers {
+		if _, keep := newPeerMap[pubStr]; !keep {
+			staleKeys[pubStr] = struct{}{}
+		}
 	}
 
-	// Ensure kernel routing table directs traffic for each peer's AllowedIPs to the WireGuard interface
-	for _, pc := range peerConfigs {
-		for _, ipNet := range pc.AllowedIPs {
+	var staleRoutes []string
+	for pubStr := range staleKeys {
+		pubKey, parseErr := wgtypes.ParseKey(pubStr)
+		if parseErr != nil {
+			continue
+		}
+		peerConfigs = append(peerConfigs, wgtypes.PeerConfig{
+			PublicKey: pubKey,
+			Remove:    true,
+		})
+		if kp, ok := kernelPeers[pubStr]; ok {
+			for _, ipNet := range kp.AllowedIPs {
+				if _, stillWanted := desiredRoutes[ipNet.String()]; !stillWanted {
+					staleRoutes = append(staleRoutes, ipNet.String())
+				}
+			}
+		} else if prev, ok := m.knownPeers[pubStr]; ok && prev.OverlayIP != "" {
+			cidr := fmt.Sprintf("%s/32", prev.OverlayIP)
+			if _, stillWanted := desiredRoutes[cidr]; !stillWanted {
+				staleRoutes = append(staleRoutes, cidr)
+			}
+		}
+	}
+
+	// Differential peer sync via native Netlink wgctrl (ReplacePeers: false preserves active handshakes & roaming NAT endpoints)
+	if len(peerConfigs) > 0 {
+		cfg := wgtypes.Config{
+			ReplacePeers: false,
+			Peers:        peerConfigs,
+		}
+		if err := c.ConfigureDevice(iface, cfg); err != nil {
+			return fmt.Errorf("failed to sync wireguard peers via netlink: %w", err)
+		}
+	}
+
+	for _, cidr := range staleRoutes {
+		_, _ = m.executor.Run(ctx, "ip", "route", "del", cidr, "dev", iface)
+	}
+
+	// Ensure kernel routing table directs traffic for each active peer's AllowedIPs to the WireGuard interface
+	for _, allowedNets := range desiredNetsByKey {
+		for _, ipNet := range allowedNets {
 			_, _ = m.executor.Run(ctx, "ip", "route", "replace", ipNet.String(), "dev", iface)
 		}
 	}
 
 	m.knownPeers = newPeerMap
-	m.logger.Debug("Synced WireGuard peers via native Netlink wgctrl", "peers", len(peerConfigs))
+	m.logger.Debug("Synced WireGuard peers via native Netlink wgctrl", "peers_total", len(newPeerMap), "peers_updated", len(peerConfigs))
 	return nil
 }
 
