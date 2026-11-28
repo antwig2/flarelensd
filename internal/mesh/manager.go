@@ -169,6 +169,10 @@ func (m *Manager) InitInterface(ctx context.Context) error {
 		return fmt.Errorf("failed to bring up interface %s: %s (%w)", iface, strings.TrimSpace(string(out)), err)
 	}
 
+	if m.cfg.OverlayIP != "" && m.cfg.Subnet != "" {
+		_, _ = m.executor.Run(ctx, "ip", "route", "replace", m.cfg.Subnet, "dev", iface, "src", m.cfg.OverlayIP)
+	}
+
 	// 5. Ensure host firewall (e.g. UFW default deny incoming) permits authenticated WireGuard overlay traffic on flarelens0
 	if _, chkErr := m.executor.Run(ctx, "iptables", "-C", "INPUT", "-i", iface, "-j", "ACCEPT"); chkErr != nil {
 		_, _ = m.executor.Run(ctx, "iptables", "-I", "INPUT", "1", "-i", iface, "-j", "ACCEPT")
@@ -346,9 +350,14 @@ func (m *Manager) SyncPeers(ctx context.Context, peers []Peer) error {
 	}
 
 	// Ensure kernel routing table directs traffic for each active peer's AllowedIPs to the WireGuard interface
+	// with explicit `src <overlay_ip>` so interfaces holding legacy primary IPs (e.g. 10.x) never violate WireGuard cryptokey routing.
 	for _, allowedNets := range desiredNetsByKey {
 		for _, ipNet := range allowedNets {
-			_, _ = m.executor.Run(ctx, "ip", "route", "replace", ipNet.String(), "dev", iface)
+			if m.cfg.OverlayIP != "" {
+				_, _ = m.executor.Run(ctx, "ip", "route", "replace", ipNet.String(), "dev", iface, "src", m.cfg.OverlayIP)
+			} else {
+				_, _ = m.executor.Run(ctx, "ip", "route", "replace", ipNet.String(), "dev", iface)
+			}
 		}
 	}
 

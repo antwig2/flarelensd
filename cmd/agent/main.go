@@ -40,7 +40,7 @@ import (
 var activeBackupOps atomic.Int32
 
 var (
-	Version = "0.2.13"
+	Version = "0.2.14"
 	Commit  = "none"
 	Date    = "unknown"
 	BuiltBy = "unknown"

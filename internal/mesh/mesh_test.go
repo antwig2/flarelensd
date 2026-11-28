@@ -293,6 +293,17 @@ func TestNativeWGControllerSync(t *testing.T) {
 		t.Fatalf("Expected 2 peers configured natively, got %d", len(mockCtrl.lastConfig.Peers))
 	}
 
+	sawExplicitSrcRoute := false
+	for _, cmd := range mockExec.commands {
+		if strings.Join(cmd, " ") == "ip route replace 100.64.0.100/32 dev flarelens0 src 100.64.0.1" {
+			sawExplicitSrcRoute = true
+			break
+		}
+	}
+	if !sawExplicitSrcRoute {
+		t.Fatalf("expected peer route to pin explicit src 100.64.0.1, commands: %v", mockExec.commands)
+	}
+
 	// Simulate kernel learning dynamic NAT endpoint for roaming client laptop after handshake
 	learnedNAT, _ := net.ResolveUDPAddr("udp", "203.0.113.45:59123")
 	for i := range mockCtrl.device.Peers {
